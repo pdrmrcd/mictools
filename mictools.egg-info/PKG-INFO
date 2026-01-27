@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: mictools
+Version: 0.1.0
+Summary: Support tools for the APS Microscopy Group
+Author: pdrmrcd
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+
+Support tools for microscopy group.
