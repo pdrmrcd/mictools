@@ -9,6 +9,7 @@ import os
 from .load_data import file_names
 from .load_data import load_interferometry_data
 from .load_data import get_scan_info
+from .load_data import load_scan
 from .config import get_path
 from .roi_utils import Roi as ROI
 
@@ -132,7 +133,7 @@ def process_roi_data(scanno, detector, roi, path=None, n_workers=None):
 def process_position_data(scanno, 
                           path=None, 
                           processing_method='basic', 
-                          th=0, 
+                          th=None, 
                           replace=False):
     '''
     Loads and processes position data from flyscan HDF5 files.
@@ -152,6 +153,10 @@ def process_position_data(scanno,
         return df
     
     interf_data = load_interferometry_data(scanno, path)
+
+    if th is None:
+        baseline_data = load_scan(scanno, stream='baseline', path=path)
+        th = baseline_data['sample_theta'].mean()
 
     # We drop the first point as it has not trigger data
     # For now, we will just average the data for each trigger
@@ -179,9 +184,12 @@ def process_position_data(scanno,
     
     return df
 
-def mesh_roi_data(scanno, detector, roi, roi_type="Intensity", th=0, path=None):
+def mesh_roi_data(scanno, detector, roi, roi_type="Intensity", th=None, path=None):
     # Load the data
     path = get_path(path)
+    if th is None:
+        baseline_data = load_scan(scanno, stream='baseline', path=path)
+        th = baseline_data['sample_theta'].mean()
     position_data = process_position_data(scanno, th=th, path=path)
     detector_data = process_roi_data(scanno, detector, roi, path=path)
 

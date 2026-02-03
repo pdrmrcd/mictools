@@ -5,6 +5,7 @@ from glob import glob
 from scipy.interpolate import griddata
 from multiprocessing import Pool, cpu_count
 from functools import partial
+import os
 
 import matplotlib.pyplot as plt
 
@@ -16,15 +17,38 @@ def load_cat(catalog_name='19id_isn'):
     cat = getDatabase(catalog_name=catalog_name)
     return cat
 
-def load_scan(scanno, cat=None, stream_name="primary"):
+def load_cat_scan(scanno, cat=None, stream="primary"):
     if cat is None:
         cat = load_cat()
-    if stream_name == "primary":
+    if stream == "primary":
         scan = cat[scanno].primary.read().to_pandas()
         # scan = scan.iloc[8:]  # remove first 8 rows which are usually bad
-    elif stream_name == "baseline":
+    elif stream == "baseline":
         scan = cat[scanno].baseline.read().to_pandas()
     return scan
+
+def load_file_scan(scanno, path=None, stream="primary"):
+    path = get_path(path)
+    file = path+f'/Scan_{scanno:04d}.h5'
+    with File(file, "r") as f:
+        # data = {}
+        if stream == "primary":
+            dset = f[f"entry/data/"]
+            data = {key: dset[key][:] for key in dset.keys()}
+        elif stream == "baseline":
+            dset = f[f"entry/instrument/bluesky/streams/baseline/"]
+            data = {key: dset[key]["value"][:] for key in dset.keys()}
+        
+    df = pd.DataFrame(data)
+    return df
+
+def load_scan(scanno, path=None, stream="primary", cat=None):
+    if cat is not None:
+        scan = load_cat_scan(scanno, cat, stream)
+    else:
+        scan = load_file_scan(scanno, path, stream)
+    return scan
+
 
 def file_names(scanno, detector, path=None):
     path = get_path(path)
