@@ -166,12 +166,14 @@ def process_position_data(scanno,
         x_pos = avg_interf['I15 (X)'].values/np.cos(-1*np.radians(th))
         y_pos = avg_interf['I7 (Y ds)'].values
 
-    x_pos /= 1e4  # convert to microns
-    y_pos /= 1e4  # convert to microns
+    # x_pos /= 1e4  # convert to microns
+    # y_pos /= 1e4  # convert to microns
+    x_pos_um = [xi/1e4 for xi in x_pos]  # convert to microns
+    y_pos_um = [yi/1e4 for yi in y_pos]  # convert to microns
 
     df = pd.DataFrame({'Trigger': triggers,
-                       'X_Position': x_pos,
-                       'Y_Position': y_pos})
+                       'X_Position': x_pos_um,
+                       'Y_Position': y_pos_um})
     
     # Ensure processed directory exists
     processed_path = path + f'/Processed/SOCKETSERVER'

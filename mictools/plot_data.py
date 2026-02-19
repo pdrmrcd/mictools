@@ -6,7 +6,7 @@ from .load_data import *
 from .process_data import *
 from .config import *
 
-def plot_flyscan(scanno, detector, roi, roi_type="Intensity", th=0, path=None, **kwargs):
+def plot_flyscan(scanno, detector, roi, roi_type="Intensity", th=None, path=None, **kwargs):
     # Load the data
     X, Y, Z = mesh_roi_data(scanno, detector, roi, roi_type, th, path)
 
