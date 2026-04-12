@@ -14,9 +14,18 @@ def plot_flyscan(scanno,
                  ch=None, 
                  th=None, 
                  path=None,
+                 abs_pos=False,
                  **kwargs):
     # Load the data
     X, Y, Z = mesh_detector_data(scanno, detector, roi=roi, roi_type=roi_type, ch=ch, th=th, path=path)
+
+    if abs_pos:
+        scan_info = get_scan_info(scanno, detector, path)
+        xi = scan_info['xi'] # xi is the starting x position of the scan in mm
+        yi = scan_info['yi'] # yi is the starting y position of the scan in mm
+        xmin = scan_info['x_min']*1e-3 # convert from um to mm
+        X = X*1e-3 + xi + xmin # convert from um to mm
+        Y = Y*-1e-3 + yi # convert from um to mm
 
     # Plot the data
     fig, ax = plt.subplots()
@@ -29,6 +38,9 @@ def plot_flyscan(scanno,
     ax.set_ylabel('Y (µm)')
 
     ax.set_title(f'Scan {scanno} - {detector} - {roi.name if roi else ch}')
+
+    if abs_pos:
+        ax.invert_yaxis() # Invert y-axis to match the physical layout of the scan
 
     plt.show()
 

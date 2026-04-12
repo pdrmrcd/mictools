@@ -6,6 +6,7 @@ from scipy.interpolate import griddata
 from multiprocessing import Pool, cpu_count
 from functools import partial
 import os
+import yaml
 
 import matplotlib.pyplot as plt
 
@@ -38,7 +39,9 @@ def load_file_scan(scanno, path=None, stream="primary"):
         elif stream == "baseline":
             dset = f[f"entry/instrument/bluesky/streams/baseline/"]
             data = {key: dset[key]["value"][:] for key in dset.keys()}
-        
+        elif stream == "metadata":
+            dset = yaml.safe_load(f[f"entry/instrument/bluesky/metadata/plan_args"][()])
+            data = {key: dset[key] for key in dset.keys()}
     df = pd.DataFrame(data)
     return df
 
@@ -57,7 +60,7 @@ def file_names(scanno, detector, path=None):
     files.sort()
     return files
 
-def get_scan_info(scanno, detector, path=None):
+def get_scan_info(scanno, detector='socketserver', path=None):
     path = get_path(path)
     data_dic = {}
     files = file_names(scanno, detector, path)
@@ -65,7 +68,13 @@ def get_scan_info(scanno, detector, path=None):
     with File(files[0], "r") as f:
         dset = f["entry/data/data"]
         data_dic['file_len'] = len(dset)
-        data_dic['shape'] = (len(dset), len(files))
+    baseline = load_file_scan(scanno, path, stream="baseline")
+    data_dic['xi'] = baseline["sample_mic_x"][0]
+    data_dic['yi'] = baseline["sample_y"][0]
+    metadata = load_file_scan(scanno, path, stream="metadata")
+    data_dic['x_min'] = metadata['x_min'][0]
+    data_dic['x_max'] = metadata['x_max'][0]
+    data_dic['shape'] = (metadata['x_npts'][0], metadata['y_npts'][0])
     return data_dic
 
 def load_image_from_scan(imno, scanno, detector, path=None):
