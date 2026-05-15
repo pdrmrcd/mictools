@@ -71,13 +71,17 @@ def get_scan_info(scanno, detector='socketserver', path=None):
     baseline = load_file_scan(scanno, path, stream="baseline")
     data_dic['xi'] = baseline["sample_mic_x"][0]
     data_dic['yi'] = baseline["sample_y"][0]
-    metadata = load_file_scan(scanno, path, stream="metadata")
-    data_dic['x_min'] = metadata['x_min'][0]
-    data_dic['x_max'] = metadata['x_max'][0]
-    data_dic['shape'] = (metadata['x_npts'][0], metadata['y_npts'][0])
+    try:
+        metadata = load_file_scan(scanno, path, stream="metadata")
+        data_dic['x_min'] = metadata['x_min'][0]
+        data_dic['x_max'] = metadata['x_max'][0]
+        data_dic['shape'] = (metadata['x_npts'][0], metadata['y_npts'][0])
+    except:
+        print('Metadata not found, probably analyzing an old flyscan...')
+        data_dic['shape'] = (len(dset), len(files))
     return data_dic
 
-def load_image_from_scan(imno, scanno, detector, path=None):
+def load_image_from_scan(scanno, detector, imno, path=None):
     path = get_path(path)
     files = file_names(scanno, detector, path)
     scan_info = get_scan_info(scanno, detector, path)
@@ -108,5 +112,4 @@ def load_interferometry_data(scanno, path=None, reduction=1):
     df = pd.concat(frames, axis=0)
     
     return df
-
 

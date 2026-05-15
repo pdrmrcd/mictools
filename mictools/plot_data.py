@@ -1,11 +1,26 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.colors as colors
 import plotly.graph_objects as go
 
 from .load_data import *
 from .process_data import *
 from .config import *
+
+def find_closest_trigger(scanno, x, y, path=None):
+    # TODO: Include abs_pos option
+    path = get_path(path)
+    position_data = process_position_data(scanno, path)
+    position_data['distance'] = np.sqrt((position_data['X_Position'] - x)**2 + (position_data['Y_Position'] - y)**2)
+    closest_trigger = position_data.loc[position_data['distance'].idxmin()]['Trigger']
+    return int(closest_trigger)
+
+def plot_closest_frame(scanno, detector, x, y, path=None, log_scale=False, **kwargs):
+    imno = find_closest_trigger(scanno, x, y, path)
+    frame = load_image_from_scan(scanno, detector, imno, path)
+    plt.imshow(frame, norm=colors.LogNorm(vmin=1, vmax=frame.max()) if log_scale else None, **kwargs)
+    plt.show()
 
 def plot_flyscan(scanno, 
                  detector, 
@@ -14,10 +29,20 @@ def plot_flyscan(scanno,
                  ch=None, 
                  th=None, 
                  path=None,
+                 norm_detector=None,
+                 norm_ch=None,
                  abs_pos=False,
                  **kwargs):
     # Load the data
-    X, Y, Z = mesh_detector_data(scanno, detector, roi=roi, roi_type=roi_type, ch=ch, th=th, path=path)
+    X, Y, Z = mesh_detector_data(scanno, 
+                                 detector, 
+                                 roi=roi, 
+                                 roi_type=roi_type, 
+                                 ch=ch, 
+                                 th=th, 
+                                 norm_detector=norm_detector,
+                                 norm_ch=norm_ch,
+                                 path=path)
 
     if abs_pos:
         scan_info = get_scan_info(scanno, detector, path)

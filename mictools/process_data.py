@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from h5py import File
+from h5py import File, ExternalLink
 from multiprocessing import Pool, cpu_count
 from scipy.interpolate import griddata
 from functools import partial
@@ -81,6 +81,85 @@ def process_tetramm_file(file, ch: int):
         f'Current {ch}': data,
     }
 
+def process_sum_detector_file(file):
+    '''
+    Process a single detector HDF5 file and sum all frames into one 2D image.
+    '''
+    with File(file, "r") as f:
+        dset = f["entry/data/data"]
+        return np.sum(dset, axis=0)
+
+def process_stack_detector_file(file):
+    '''
+    Process a single detector HDF5 file and return all frames as a 3D array.
+    '''
+    with File(file, "r") as f:
+        dset = f["entry/data/data"]
+        return dset[:]
+
+
+def sum_detector_image(scanno, detector, path=None, n_workers=None):
+    '''
+    Sum all detector images across all files for a given scan.
+
+    Parameters:
+    - scanno: Scan number (int)
+    - detector: Detector name (str). Can be 'me7', 'xrd', 'ptycho'.
+    - path: Path to data files (str)
+    - n_workers: Number of parallel workers (int, optional).
+                 Defaults to cpu_count() - 1
+
+    Returns:
+    - 2D numpy array containing the summed detector image.
+    '''
+    path = get_path(path)
+    files = file_names(scanno, detector, path)
+
+    if len(files) == 0:
+        raise FileNotFoundError(
+            f"No files found for scan {scanno} and detector '{detector}' in path '{path}'."
+        )
+
+    if n_workers is None:
+        n_workers = max(1, cpu_count() - 1)
+
+    with Pool(processes=n_workers) as pool:
+        summed_files = pool.map(process_sum_detector_file, files)
+
+    summed_image = np.sum(summed_files, axis=0)
+    return summed_image
+
+
+def stack_detector_image(scanno, detector, path=None, n_workers=None):
+    '''
+    Stack all detector images across all files for a given scan.
+
+    Parameters:
+    - scanno: Scan number (int)
+    - detector: Detector name (str). Can be 'me7', 'xrd', 'ptycho'.
+    - path: Path to data files (str)
+    - n_workers: Number of parallel workers (int, optional).
+                 Defaults to cpu_count() - 1
+
+    Returns:
+    - 3D numpy array with shape (n_frames_total, y, x).
+    '''
+    path = get_path(path)
+    files = file_names(scanno, detector, path)
+
+    if len(files) == 0:
+        raise FileNotFoundError(
+            f"No files found for scan {scanno} and detector '{detector}' in path '{path}'."
+        )
+
+    if n_workers is None:
+        n_workers = max(1, cpu_count() - 1)
+
+    with Pool(processes=n_workers) as pool:
+        stacked_files = pool.map(process_stack_detector_file, files)
+
+    stacked_image = np.concatenate(stacked_files, axis=0)
+    return stacked_image
 
 
 
@@ -88,9 +167,11 @@ def process_tetramm_file(file, ch: int):
 def process_detector_data(scanno, 
                      detector, 
                      roi=None, 
-                     ch=None, 
+                     ch=None,
+                     custom_proc=None, 
                      path=None, 
-                     n_workers=None):
+                     n_workers=None,
+                     replace=False):
     '''
     Loads processed data from a region of interest (ROI) or Tetramm current
     data in flyscan HDF5 files using parallel processing. 
@@ -113,12 +194,19 @@ def process_detector_data(scanno,
     
     # Check if processed data already exists
     if roi is not None:
-        processed_path = path + f'/Processed/{detector}/Scan_{scanno:04d}_{roi.name}.csv'
+        processed_path = path + f'/Processed/{detector.upper()}/Scan_{scanno:04d}_{roi.name}.h5'
+        if os.path.exists(processed_path) and not replace:
+            with File(processed_path, 'r') as f:
+                data = {key: f['entry/data'][key][:] for key in f['entry/data'].keys()}
+            return pd.DataFrame(data)
     elif ch is not None:
-        processed_path = path + f'/Processed/{detector}/Scan_{scanno:04d}_channel_{ch}.csv'
-    if os.path.exists(processed_path):
-        df = pd.read_csv(processed_path)
-        return df
+        processed_path = path + f'/Processed/{detector.upper()}/Scan_{scanno:04d}_channel_{ch}.h5'
+        if os.path.exists(processed_path) and not replace:
+            with File(processed_path, 'r') as f:
+                current = f[f'entry/data/Current {ch}'][:]
+            return pd.DataFrame({f'Current {ch}': current})
+    elif custom_proc is not None:
+        processed_path = path + f'/Processed/{detector.upper()}/Scan_{scanno:04d}_{custom_proc}.h5'
     
     # Data processing
 
@@ -174,13 +262,58 @@ def process_detector_data(scanno,
         
         df = pd.DataFrame(current_data, columns=[f'Current {ch}'])
 
+    elif custom_proc is not None:
+
+        raise 'Custom data processing needs to be ran previously.'
+
     # Ensure processed directory exists
     save_dir = os.path.dirname(processed_path)
     os.makedirs(save_dir, exist_ok=True)
 
-    # Save to CSV
-    # TODO: Change to HDF5 format later
-    df.to_csv(processed_path, index=False)
+    # Save to HDF5
+    if roi is not None:
+        with File(processed_path, 'w') as f:
+            entry = f.create_group('entry')
+            entry.attrs['NX_class'] = 'NXentry'
+
+            nxdata = entry.create_group('data')
+            nxdata.attrs['NX_class']   = 'NXdata'
+            nxdata.attrs['signal']     = 'Intensity'
+            nxdata.attrs['axes']       = 'Timestamp'
+            nxdata.attrs['roi_name']   = roi.name
+            nxdata.attrs['roi_y_start'] = roi.y_start
+            nxdata.attrs['roi_y_end']   = roi.y_end
+            nxdata.attrs['roi_x_start'] = roi.x_start
+            nxdata.attrs['roi_x_end']   = roi.x_end
+
+            nxdata.create_dataset('Timestamp', data=df['Timestamp'].values)
+            ds = nxdata.create_dataset('Intensity', data=df['Intensity'].values)
+            ds.attrs['long_name'] = 'ROI Intensity'
+            nxdata.create_dataset('COM_Y', data=df['COM_Y'].values)
+            nxdata.create_dataset('COM_X', data=df['COM_X'].values)
+
+        link_path = f'entry/data/{detector.upper()}/{roi.name}'
+
+    elif ch is not None:
+        with File(processed_path, 'w') as f:
+            entry = f.create_group('entry')
+            entry.attrs['NX_class'] = 'NXentry'
+
+            nxdata = entry.create_group('data')
+            nxdata.attrs['NX_class'] = 'NXdata'
+            nxdata.attrs['signal']   = f'Current {ch}'
+
+            ds = nxdata.create_dataset(f'Current {ch}', data=df[f'Current {ch}'].values)
+            ds.attrs['units']     = 'A'
+            ds.attrs['long_name'] = f'Tetramm channel {ch} current'
+
+        link_path = f'entry/data/{detector.upper()}/channel_{ch}'
+
+    master_path = path + f'/Scan_{scanno:04d}.h5'
+    with File(master_path, 'a') as f:
+        if link_path in f:
+            del f[link_path]
+        f[link_path] = ExternalLink(processed_path, 'entry/data')
 
     return df
 
@@ -197,14 +330,17 @@ def process_position_data(scanno,
     Parameters:
     - scanno: Scan number (int)
     '''
-    #TODO: We need to get the th value from the master file
 
     path = get_path(path)
 
     # Check if processed data already exists
-    processed_path = path + f'/Processed/SOCKETSERVER/Scan_{scanno:04d}_position.csv'
+    processed_path = path + f'/Processed/SOCKETSERVER/Scan_{scanno:04d}_position.h5'
     if os.path.exists(processed_path) and not replace:
-        df = pd.read_csv(processed_path)
+        with File(processed_path, 'r') as f:
+            triggers   = f['entry/data/Trigger'][:]
+            x_position = f['entry/data/X_Position'][:]
+            y_position = f['entry/data/Y_Position'][:]
+        df = pd.DataFrame({'Trigger': triggers, 'X_Position': x_position, 'Y_Position': y_position})
         return df
     
     interf_data = load_interferometry_data(scanno, path)
@@ -248,17 +384,48 @@ def process_position_data(scanno,
     df['Y_Position'] = df['Y_Position'] - df['Y_Position'].iloc[0]
     
     # Ensure processed directory exists
-    processed_path = path + f'/Processed/SOCKETSERVER'
-    # print(processed_path)
-    # save_dir = os.path.dirname(processed_path)
-    os.makedirs(processed_path, exist_ok=True)
-    
-    df.to_csv(path + f'/Processed/SOCKETSERVER/Scan_{scanno:04d}_position.csv', 
-              index=False)
+    processed_dir = path + f'/Processed/SOCKETSERVER'
+    os.makedirs(processed_dir, exist_ok=True)
+
+    h5_path = processed_dir + f'/Scan_{scanno:04d}_position.h5'
+    with File(h5_path, 'w') as f:
+        entry = f.create_group('entry')
+        entry.attrs['NX_class'] = 'NXentry'
+
+        nxdata = entry.create_group('data')
+        nxdata.attrs['NX_class']  = 'NXdata'
+        nxdata.attrs['signal']    = 'Y_Position'
+        nxdata.attrs['axes']      = 'X_Position'
+        nxdata.attrs['x_indices'] = [0]
+
+        nxdata.create_dataset('Trigger', data=df['Trigger'].values)
+
+        ds = nxdata.create_dataset('X_Position', data=df['X_Position'].values)
+        ds.attrs['units']     = 'um'
+        ds.attrs['long_name'] = 'Sample X position'
+
+        ds = nxdata.create_dataset('Y_Position', data=df['Y_Position'].values)
+        ds.attrs['units']     = 'um'
+        ds.attrs['long_name'] = 'Sample Y position'
+
+    master_path = path + f'/Scan_{scanno:04d}.h5'
+    with File(master_path, 'a') as f:
+        if 'entry/data/Position' in f:
+            del f['entry/data/Position']
+        f['entry/data/Position'] = ExternalLink(h5_path, 'entry/data')
+
     
     return df
 
-def mesh_detector_data(scanno, detector, roi=None, roi_type="Intensity", ch=None, th=None, path=None):
+def mesh_detector_data(scanno, 
+                       detector, 
+                       roi=None, 
+                       roi_type="Intensity", 
+                       ch=None, 
+                       th=None, 
+                       path=None,
+                       norm_detector=False,
+                       norm_ch=None):
     # Load the data
     path = get_path(path)
     if th is None:
@@ -266,6 +433,11 @@ def mesh_detector_data(scanno, detector, roi=None, roi_type="Intensity", ch=None
         th = baseline_data['sample_theta'].mean()
     position_data = process_position_data(scanno, th=th, path=path)
     detector_data = process_detector_data(scanno, detector, roi=roi, ch=ch, path=path)
+    if norm_detector:
+        if not norm_ch:
+            norm_ch=1
+        norm_data = process_detector_data(scanno, norm_detector, ch=norm_ch, path=path)
+        detector_data = detector_data/norm_data
 
     # Align lengths
     min_len = min(len(detector_data), len(position_data))
