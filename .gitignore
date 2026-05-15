@@ -1,4 +1,10 @@
 __pycache__
 /notebooks/
 .loglogin
+/mictools/live_scan.py
+mictools.egg-info/
+dist/
+build/
+*.h5
+*.pyc
 
