@@ -264,7 +264,7 @@ def process_detector_data(scanno,
 
     elif custom_proc is not None:
 
-        raise 'Custom data processing needs to be ran previously.'
+        return 'Custom data processing needs to be ran previously.'
 
     # Ensure processed directory exists
     save_dir = os.path.dirname(processed_path)
@@ -313,7 +313,7 @@ def process_detector_data(scanno,
     with File(master_path, 'a') as f:
         if link_path in f:
             del f[link_path]
-        f[link_path] = ExternalLink(processed_path, 'entry/data')
+        f[link_path] = ExternalLink(processed_path, 'entry/data/processed_data')
 
     return df
 
@@ -374,7 +374,7 @@ def process_position_data(scanno,
     # x_pos /= 1e4  # convert to microns
     # y_pos /= 1e4  # convert to microns
     x_pos_um = [xi/1e4 for xi in x_pos]  # convert to microns
-    y_pos_um = [yi/1e4 for yi in y_pos]  # convert to microns
+    y_pos_um = [yi/1e4 for yi in y_pos] # type: ignore # convert to microns
 
     df = pd.DataFrame({'Trigger': triggers,
                        'X_Position': x_pos_um,
@@ -425,9 +425,31 @@ def mesh_detector_data(scanno,
                        th=None, 
                        path=None,
                        norm_detector=False,
-                       norm_ch=None):
-    # Load the data
+                       norm_ch=None,
+                       abs_pos=True,
+                       replace=False):
+
     path = get_path(path)
+    master_path = path + f'/Scan_{scanno:04d}.h5'
+
+    # Define image group path and processed data path based on roi or channel
+    if roi is not None:
+        images_path = f'entry/data/{detector.upper()}/{roi.name}/images'
+        processed_path = path + f'/Processed/{detector.upper()}/Scan_{scanno:04d}_{roi.name}.h5'
+    elif ch is not None:
+        images_path = f'entry/data/{detector.upper()}/channel_{ch}/images'
+        processed_path = path + f'/Processed/{detector.upper()}/Scan_{scanno:04d}_channel_{ch}.h5'
+
+    # Return cached result if available and replace is False
+    if not replace:
+        with File(master_path, 'r') as f:
+            if images_path in f:
+                X = f[images_path]['X'][:]
+                Y = f[images_path]['Y'][:]
+                Z = f[images_path]['Z'][:]
+                return X, Y, Z
+
+    # Load the data
     if th is None:
         baseline_data = load_scan(scanno, stream='baseline', path=path)
         th = baseline_data['sample_theta'].mean()
@@ -435,9 +457,9 @@ def mesh_detector_data(scanno,
     detector_data = process_detector_data(scanno, detector, roi=roi, ch=ch, path=path)
     if norm_detector:
         if not norm_ch:
-            norm_ch=1
+            norm_ch = 1
         norm_data = process_detector_data(scanno, norm_detector, ch=norm_ch, path=path)
-        detector_data = detector_data/norm_data
+        detector_data = detector_data / norm_data
 
     # Align lengths
     min_len = min(len(detector_data), len(position_data))
@@ -454,13 +476,34 @@ def mesh_detector_data(scanno,
     y = np.linspace(position_data['Y_Position'].min(), position_data['Y_Position'].max(), ny)
     X, Y = np.meshgrid(x, y)
 
+    if abs_pos:
+        scan_info = get_scan_info(scanno, detector, path)
+        xi = scan_info['xi']
+        yi = scan_info['yi']
+        xmin = scan_info['x_min'] * 1e-3
+        X = X * 1e-3 + xi + xmin
+        Y = Y * -1e-3 + yi
+
     # Interpolate onto grid
     pts = position_data[['X_Position', 'Y_Position']].values
     data_pts = detector_data.values
-    Z_linear = griddata(pts, data_pts, (X, Y), method='linear')    # smooth, NaN outside convex hull
-    Z_nearest = griddata(pts, data_pts, (X, Y), method='nearest')  # fills everywhere
+    Z_linear = griddata(pts, data_pts, (X, Y), method='linear')
+    Z_nearest = griddata(pts, data_pts, (X, Y), method='nearest')
 
     # Fill gaps outside convex hull using nearest neighbor
     Z = np.where(np.isnan(Z_linear), Z_nearest, Z_linear)
+
+    # Save X, Y, Z to master file
+    with File(master_path, 'a') as f:
+        if images_path in f:
+            del f[images_path]
+        nximages = f.create_group(images_path)
+        nximages.attrs['NX_class']       = 'NXdata'
+        nximages.attrs['signal']         = 'Z'
+        nximages.attrs['axes']           = ['Y', 'X']
+        nximages.attrs['processed_data'] = processed_path
+        nximages.create_dataset('X', data=X)
+        nximages.create_dataset('Y', data=Y)
+        nximages.create_dataset('Z', data=Z)
 
     return X, Y, Z
