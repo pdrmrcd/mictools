@@ -1,6 +1,7 @@
 __pycache__
 /notebooks/
 .loglogin
+.vscode
 /mictools/live_scan.py
 mictools.egg-info/
 dist/

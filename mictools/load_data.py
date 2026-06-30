@@ -84,7 +84,7 @@ def get_scan_info(scanno, detector='socketserver', path=None):
         data_dic['x_min'] = metadata['x_min'][0]
         data_dic['x_max'] = metadata['x_max'][0]
         data_dic['shape'] = (metadata['x_npts'][0], metadata['y_npts'][0])
-    except KeyError:
+    except:
         print('Metadata not found, probably analyzing an old flyscan...')
         data_dic['shape'] = (file_len, len(files))
     return data_dic

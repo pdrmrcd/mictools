@@ -48,7 +48,7 @@ def fit_scan(scanno, xcol, ycol, normcol=None, visualize = False,
             return trace, output
         
         trace.show()
-        
+    
     if getData:
         return x_data, y_data, output
     
@@ -65,8 +65,7 @@ def graph_run(scans, xcol, ycol, zcol='Scan', normcol=None):
     
     for scanno in scans:
         
-        xdata, ydata, _ = fit_scan(scanno, xcol=xcol, ycol=ycol,
-                                                normcol=normcol, getData=True)
+        xdata, ydata, _ = fit_scan(scanno, xcol=xcol, ycol=ycol, normcol=normcol, getData=True) # type: ignore
         
         if  zcol=='Scan':
             zval = scanno
@@ -107,8 +106,7 @@ def analyze_run(scans, xcol, ycol, zcol='Scan', normcol=None,
         
         for scanno in scans:
             
-            xdata, ydata, output = fit_scan(scanno, xcol=xcol, ycol=ycol,
-                                                  normcol=normcol, getData=True)
+            xdata, ydata, output = fit_scan(scanno, xcol=xcol, ycol=ycol, normcol=normcol, getData=True) # type: ignore
             
 
             baseline = load_scan(scanno, stream="baseline")
@@ -121,7 +119,7 @@ def analyze_run(scans, xcol, ycol, zcol='Scan', normcol=None,
             frame = pd.DataFrame(data={xcol: xdata, ycol: ydata, zcol:zdata}) 
             dataFrames.append(frame)
             
-            xdatanew = np.linspace(xdata[0], xdata[-1], len(xdata)*10)
+            xdatanew = np.linspace(xdata[0], xdata[-1], len(xdata)*10) # type: ignore
             ydatanew = model.eval(params=output.params, x=xdatanew)
             zdatanew = zval*np.ones(len(ydatanew))
             frameFit = pd.DataFrame(data={xcol: xdatanew, ycol + ' fit': ydatanew, 

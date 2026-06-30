@@ -31,7 +31,7 @@ def plot_flyscan(scanno,
                  path=None,
                  norm_detector=None,
                  norm_ch=None,
-                 abs_pos=False,
+                 abs_pos=True,
                  **kwargs):
     # Load the data
     X, Y, Z = mesh_detector_data(scanno, 
@@ -42,15 +42,9 @@ def plot_flyscan(scanno,
                                  th=th, 
                                  norm_detector=norm_detector,
                                  norm_ch=norm_ch,
-                                 path=path)
-
-    if abs_pos:
-        scan_info = get_scan_info(scanno, detector, path)
-        xi = scan_info['xi'] # xi is the starting x position of the scan in mm
-        yi = scan_info['yi'] # yi is the starting y position of the scan in mm
-        xmin = scan_info['x_min']*1e-3 # convert from um to mm
-        X = X*1e-3 + xi + xmin # convert from um to mm
-        Y = Y*-1e-3 + yi # convert from um to mm
+                                 path=path,
+                                 abs_pos=abs_pos,
+                                 )
 
     # Plot the data
     fig, ax = plt.subplots()
@@ -70,7 +64,7 @@ def plot_flyscan(scanno,
     plt.show()
 
 
-def plot_meshed_data(X, Y, Z, ax = None, fig = None):
+def plot_meshed_data(X, Y, Z, ax = None, fig = None, **kwargs):
 
     if ax is None or fig is None:
         fig, ax = plt.subplots()
