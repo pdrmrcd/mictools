@@ -12,7 +12,46 @@ from .load_data import get_scan_info
 from .load_data import load_scan
 from .config import get_path
 from .roi_utils import Roi as ROI
+from .roi_utils import RoiRegistry
 
+
+def _resolve_roi(roi, path, register=False, override=False):
+    '''
+    Normalize the ``roi`` argument to a :class:`Roi` (or ``None``) via the registry.
+
+    Accepts either a :class:`Roi` instance or a registered ROI **name** (str):
+
+    - ``None`` -> ``None`` (channel/current mode).
+    - ``str``  -> looked up in the experiment's ROI registry (``ValueError`` if unknown).
+    - ``Roi``  -> validated; a falsy name is rejected (guards ``Scan_XXXX_None.h5``).
+                  If its name is already registered with a *different* geometry,
+                  raise ``ValueError`` unless ``override=True`` (this is what closes
+                  the silent stale-cache collision, since caching keys on name).
+                  When ``register=True`` the ROI is added to the registry so its
+                  usage can be tracked.
+    '''
+    if roi is None:
+        return None
+    if isinstance(roi, str):
+        return RoiRegistry.load(path).get(roi)
+    if not isinstance(roi, ROI):
+        raise ValueError(
+            "roi must be a Roi instance (roi_utils.Roi) or a registered ROI name (str)."
+        )
+    if not roi.name:
+        raise ValueError(
+            "roi.name must be set (it is used to build filenames and HDF5 paths)."
+        )
+    reg = RoiRegistry.load(path)
+    if roi.name in reg.names() and not reg.get(roi.name).same_geometry(roi) and not override:
+        raise ValueError(
+            f"ROI name {roi.name!r} is already registered with a different geometry "
+            f"{reg.get(roi.name).as_tuple()}. Pass roi_override=True to replace it "
+            f"(the previous definition and its scan list are archived), or use a new name."
+        )
+    if register:
+        reg.add(roi, override=override)
+    return roi
 
 
 def process_roi_file(file, roi):
@@ -108,7 +147,7 @@ def process_stack_detector_file(file):
         return dset[:]
 
 
-def sum_detector_image(scanno, detector, path=None, n_workers=None):
+def sum_detector_images(scanno, detector, path=None, n_workers=None):
     '''
     Sum all detector images across all files for a given scan.
 
@@ -178,10 +217,11 @@ def process_detector_data(scanno,
                      detector, 
                      roi=None, 
                      ch=None,
-                     custom_proc=None, 
-                     path=None, 
+                     custom_proc=None,
+                     path=None,
                      n_workers=None,
-                     replace=False):
+                     replace=False,
+                     roi_override=False):
     '''
     Loads processed data from a region of interest (ROI) or Tetramm current
     data in flyscan HDF5 files using parallel processing. 
@@ -201,7 +241,10 @@ def process_detector_data(scanno,
     '''
 
     path = get_path(path)
-    
+
+    # Accept a Roi instance or a registered ROI name; enforce name/geometry uniqueness.
+    roi = _resolve_roi(roi, path, register=False, override=roi_override)
+
     # Check if processed data already exists
     if roi is not None:
         processed_path = path + f'/Processed/{detector.upper()}/Scan_{scanno:04d}_{roi.name}.h5'
@@ -540,15 +583,21 @@ def mesh_detector_data(scanno,
                        norm_ch=None,
                        abs_pos=True,
                        replace=False,
-                       missed_frame_position='Beginning'):
-    
+                       missed_frame_position='Beginning',
+                       roi_override=False):
+
     # Load the data
 
     path = get_path(path)
     master_path = path + f'/Scan_{scanno:04d}.h5'
 
+    # Accept a Roi instance or a registered ROI name; register-on-use so the
+    # scan can be recorded against the ROI (push-tracked reproducibility).
+    roi = _resolve_roi(roi, path, register=True, override=roi_override)
+
     # Define image group path and processed data path based on roi or channel
     if roi is not None:
+        RoiRegistry.load(path).record_usage(roi.name, scanno)
         images_path = f'entry/data/{detector.upper()}/Images/{roi.name}'
         processed_path = path + f'/Processed/{detector.upper()}/Scan_{scanno:04d}_{roi.name}.h5'
     elif ch is not None:
@@ -592,7 +641,7 @@ def mesh_detector_data(scanno,
     #     detector_data = detector_data[f'Current {ch}'][:min_len]
 
     scan_info = get_scan_info(scanno, detector, path)
-    ny, nx = scan_info['shape']
+    nx, ny = scan_info['shape']
 
     x = np.linspace(position_data['X_Position'].min(), position_data['X_Position'].max(), nx)
     y = np.linspace(position_data['Y_Position'].min(), position_data['Y_Position'].max(), ny)

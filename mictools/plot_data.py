@@ -32,18 +32,22 @@ def plot_flyscan(scanno,
                  norm_detector=None,
                  norm_ch=None,
                  abs_pos=True,
+                 replace=False,
+                 roi_override=False,
                  **kwargs):
     # Load the data
-    X, Y, Z = mesh_detector_data(scanno, 
-                                 detector, 
-                                 roi=roi, 
-                                 roi_type=roi_type, 
-                                 ch=ch, 
-                                 th=th, 
+    X, Y, Z = mesh_detector_data(scanno,
+                                 detector,
+                                 roi=roi,
+                                 roi_type=roi_type,
+                                 ch=ch,
+                                 th=th,
                                  norm_detector=norm_detector,
                                  norm_ch=norm_ch,
                                  path=path,
                                  abs_pos=abs_pos,
+                                 replace=replace,
+                                 roi_override=roi_override,
                                  )
 
     # Plot the data
@@ -56,7 +60,9 @@ def plot_flyscan(scanno,
     ax.set_xlabel('X (µm)')
     ax.set_ylabel('Y (µm)')
 
-    ax.set_title(f'Scan {scanno} - {detector} - {roi.name if roi else ch}')
+    # roi may be a Roi instance or a registered ROI name (str).
+    roi_label = roi if isinstance(roi, str) else (roi.name if roi is not None else ch)
+    ax.set_title(f'Scan {scanno} - {detector} - {roi_label}')
 
     if abs_pos:
         ax.invert_yaxis() # Invert y-axis to match the physical layout of the scan
