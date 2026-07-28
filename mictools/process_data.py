@@ -13,45 +13,7 @@ from .load_data import load_scan
 from .config import get_path
 from .roi_utils import Roi as ROI
 from .roi_utils import RoiRegistry
-
-
-def _resolve_roi(roi, path, register=False, override=False):
-    '''
-    Normalize the ``roi`` argument to a :class:`Roi` (or ``None``) via the registry.
-
-    Accepts either a :class:`Roi` instance or a registered ROI **name** (str):
-
-    - ``None`` -> ``None`` (channel/current mode).
-    - ``str``  -> looked up in the experiment's ROI registry (``ValueError`` if unknown).
-    - ``Roi``  -> validated; a falsy name is rejected (guards ``Scan_XXXX_None.h5``).
-                  If its name is already registered with a *different* geometry,
-                  raise ``ValueError`` unless ``override=True`` (this is what closes
-                  the silent stale-cache collision, since caching keys on name).
-                  When ``register=True`` the ROI is added to the registry so its
-                  usage can be tracked.
-    '''
-    if roi is None:
-        return None
-    if isinstance(roi, str):
-        return RoiRegistry.load(path).get(roi)
-    if not isinstance(roi, ROI):
-        raise ValueError(
-            "roi must be a Roi instance (roi_utils.Roi) or a registered ROI name (str)."
-        )
-    if not roi.name:
-        raise ValueError(
-            "roi.name must be set (it is used to build HDF5 group paths)."
-        )
-    reg = RoiRegistry.load(path)
-    if roi.name in reg.names() and not reg.get(roi.name).same_geometry(roi) and not override:
-        raise ValueError(
-            f"ROI name {roi.name!r} is already registered with a different geometry "
-            f"{reg.get(roi.name).as_tuple()}. Pass roi_override=True to replace it "
-            f"(the previous definition and its scan list are archived), or use a new name."
-        )
-    if register:
-        reg.add(roi, override=override)
-    return roi
+from .roi_utils import _resolve_roi
 
 
 def process_roi_file(file, roi):
@@ -105,136 +67,55 @@ def process_roi_file(file, roi):
         'times': times
     }
 
-def process_tetramm_file(file, ch: int):
+def process_tetramm_file(file, channels):
     '''
-    Process a single Tetramm HDF5 file and extract channel current.
-    
+    Process a single Tetramm HDF5 file and extract current for one or more
+    channels in a single read (the file is opened once regardless of how many
+    channels are requested).
+
     Parameters:
     - file: Path to HDF5 file (str)
-    - ch: Channel number (int) 
-    
-    Returns:
-    - Dictionary containing intensity, COM positions, and timestamps
-    '''
-
-    if not isinstance(ch, int) or ch < 0 or ch > 3:
-        raise ValueError("Channel number must be an integer between 0 and 4.")
-    
-    with File(file, "r") as f:
-        dset = f["entry/data/data"]
-        data = dset[:, 0, ch-1]
-    
-    return {
-        f'Current {ch}': data,
-    }
-
-def process_sum_detector_file(file):
-    '''
-    Process a single detector HDF5 file and sum all frames into one 2D image.
-    '''
-    with File(file, "r") as f:
-        dset = f["entry/data/data"]
-        return np.sum(dset, axis=0)
-
-def process_stack_detector_file(file):
-    '''
-    Process a single detector HDF5 file and return all frames as a 3D array.
-    '''
-    with File(file, "r") as f:
-        dset = f["entry/data/data"]
-        return dset[:]
-
-
-def sum_detector_images(scanno, detector, path=None, n_workers=None):
-    '''
-    Sum all detector images across all files for a given scan.
-
-    Parameters:
-    - scanno: Scan number (int)
-    - detector: Detector name (str). Can be 'me7', 'xrd', 'ptycho'.
-    - path: Path to data files (str)
-    - n_workers: Number of parallel workers (int, optional).
-                 Defaults to cpu_count() - 1
+    - channels: Channel number (int) or iterable of channel numbers, each
+        between 1 and 4
 
     Returns:
-    - 2D numpy array containing the summed detector image.
+    - Dictionary mapping 'Current {ch}' -> array, for each requested channel
     '''
-    path = get_path(path)
-    files = file_names(scanno, detector, path)
 
-    if len(files) == 0:
-        raise FileNotFoundError(
-            f"No files found for scan {scanno} and detector '{detector}' in path '{path}'."
-        )
+    channels = [channels] if isinstance(channels, int) else list(channels)
+    for ch in channels:
+        if not isinstance(ch, int) or ch < 1 or ch > 4:
+            raise ValueError("Channel number must be an integer between 1 and 4.")
 
-    if n_workers is None:
-        n_workers = max(1, cpu_count() - 1)
+    with File(file, "r") as f:
+        dset = f["entry/data/data"]
+        data = dset[:, 0, :]
 
-    with Pool(processes=n_workers) as pool:
-        summed_files = pool.map(process_sum_detector_file, files)
-
-    summed_image = np.sum(summed_files, axis=0)
-    return summed_image
+    return {f'Current {ch}': data[:, ch - 1] for ch in channels}
 
 
-def stack_detector_image(scanno, detector, path=None, n_workers=None):
+
+def process_roi_data(scanno,
+                      detector,
+                      roi,
+                      path=None,
+                      n_workers=None,
+                      replace=False,
+                      roi_override=False):
     '''
-    Stack all detector images across all files for a given scan.
-
-    Parameters:
-    - scanno: Scan number (int)
-    - detector: Detector name (str). Can be 'me7', 'xrd', 'ptycho'.
-    - path: Path to data files (str)
-    - n_workers: Number of parallel workers (int, optional).
-                 Defaults to cpu_count() - 1
-
-    Returns:
-    - 3D numpy array with shape (n_frames_total, y, x).
-    '''
-    path = get_path(path)
-    files = file_names(scanno, detector, path)
-
-    if len(files) == 0:
-        raise FileNotFoundError(
-            f"No files found for scan {scanno} and detector '{detector}' in path '{path}'."
-        )
-
-    if n_workers is None:
-        n_workers = max(1, cpu_count() - 1)
-
-    with Pool(processes=n_workers) as pool:
-        stacked_files = pool.map(process_stack_detector_file, files)
-
-    stacked_image = np.concatenate(stacked_files, axis=0)
-    return stacked_image
-
-
-
-
-def process_detector_data(scanno, 
-                     detector, 
-                     roi=None, 
-                     ch=None,
-                     custom_proc=None,
-                     path=None,
-                     n_workers=None,
-                     replace=False,
-                     roi_override=False):
-    '''
-    Loads processed data from a region of interest (ROI) or Tetramm current
-    data in flyscan HDF5 files using parallel processing. 
-    For ROI mode, it returns an Nx4 array where the first column is 
-    timestamps, and the following columns are intensity in ROI, 
+    Loads processed ROI data (intensity + center of mass) from flyscan HDF5
+    files using parallel processing. Returns an Nx4 DataFrame where the first
+    column is timestamps, and the following columns are intensity in ROI,
     COM y-position, and COM x-position.
-    For Tetramm mode, it returns an Nx1 array with the tetramm current data.
-    
+
     Parameters:
     - scanno: Scan number (int)
-    - detector: Detector name (str). Can be 'me7', 'xrd', 'ptycho'.
-    - path: Path to data files (str)
-    - roi: Region of interest defined from roi_utils.py as 
+    - detector: Detector name (str). Must be an area detector such as
+        'me7', 'xrd', 'ptycho', 'rayspec'.
+    - roi: Region of interest defined from roi_utils.py as
         roiN = roi(y_start, y_end, x_start, x_end, name="roiN")
-    - n_workers: Number of parallel workers (int, optional). 
+    - path: Path to data files (str)
+    - n_workers: Number of parallel workers (int, optional).
                  Defaults to cpu_count() - 1
     '''
 
@@ -243,84 +124,59 @@ def process_detector_data(scanno,
     # Accept a Roi instance or a registered ROI name; enforce name/geometry uniqueness.
     roi = _resolve_roi(roi, path, register=False, override=roi_override)
 
+    if roi is None:
+        raise ValueError(
+            "process_roi_data requires a non-None 'roi' argument "
+            "(a Roi instance or a registered ROI name)."
+        )
+
     # Check if processed data already exists
-    if roi is not None:
-        processed_path = path + f'/Processed/Scan_{scanno:04d}/{detector.lower()}.h5'
-        group_path = f'entry/data/{roi.name}'
-        if os.path.exists(processed_path) and not replace:
-            with File(processed_path, 'r') as f:
-                if group_path in f:
-                    data = {key: f[f'{group_path}/{key}'][:] for key in f[group_path].keys()}
-                    return pd.DataFrame(data)
-    elif ch is not None:
-        processed_path = path + f'/Processed/Scan_{scanno:04d}/{detector.lower()}.h5'
-        group_path = f'entry/data/channel_{ch}'
-        if os.path.exists(processed_path) and not replace:
-            with File(processed_path, 'r') as f:
-                if group_path in f:
-                    current = f[f'{group_path}/Current {ch}'][:]
-                    return pd.DataFrame({f'Current {ch}': current})
-    elif custom_proc is not None:
-        processed_path = path + f'/Processed/Scan_{scanno:04d}/{detector.lower()}.h5'
-    
+    processed_path = path + f'/Processed/Scan_{scanno:04d}/{detector.lower()}.h5'
+    group_path = f'entry/data/{roi.name}'
+    if os.path.exists(processed_path) and not replace:
+        with File(processed_path, 'r') as f:
+            if group_path in f:
+                data = {key: f[f'{group_path}/{key}'][:] for key in f[group_path].keys()}
+                return pd.DataFrame(data)
+
     # Data processing
 
     files = file_names(scanno, detector, path)
-    
+
     # Determine number of workers
     if n_workers is None:
         n_workers = max(1, cpu_count() - 1)
 
-    if roi is not None:
+    # Check if roi is an instance of roi class
+    if not isinstance(roi, ROI):
+        raise ValueError("roi must be an instance of roi class from roi_utils.py" \
+        "defined from roi_utils.py as roiN = roi(y_start, y_end, x_start, x_end, name=\"roiN\")")
 
-        # Check if roi is an instance of roi class
-        if not isinstance(roi, ROI):
-            raise ValueError("roi must be an instance of roi class from roi_utils.py" \
-            "defined from roi_utils.py as roiN = roi(y_start, y_end, x_start, x_end, name=\"roiN\")")
-    
-        # Create partial function with fixed roi parameter
-        process_func = partial(process_roi_file, roi=roi)
-        
-        # Process files in parallel
-        with Pool(processes=n_workers) as pool:
-            results = pool.map(process_func, files)
-        
-        # Concatenate results
-        intensity = np.concatenate([r['intensity'] for r in results], axis=0)
-        com_y = np.concatenate([r['com_y'] for r in results], axis=0)
-        com_x = np.concatenate([r['com_x'] for r in results], axis=0)
-        times = np.concatenate([r['times'] for r in results], axis=0)
-        
-        data_array = np.concatenate([
-            times[:, np.newaxis], 
-            intensity[:, np.newaxis],
-            com_y[:, np.newaxis], 
-            com_x[:, np.newaxis]
-        ], axis=1)
+    # Create partial function with fixed roi parameter
+    process_func = partial(process_roi_file, roi=roi)
 
-        df = pd.DataFrame(data_array, columns=['Timestamp', 
-                                            'Intensity', 
-                                            'COM_Y', 
-                                            'COM_X'])
-        
-    elif ch is not None:
+    # Process files in parallel
+    with Pool(processes=n_workers) as pool:
+        results = pool.map(process_func, files)
 
-        # Create partial function with fixed channel parameter
-        process_func = partial(process_tetramm_file, ch=ch)
-        
-        # Process files in parallel
-        with Pool(processes=n_workers) as pool:
-            results = pool.map(process_func, files)
-        
-        # Concatenate results
-        current_data = np.concatenate([r[f'Current {ch}'] for r in results], axis=0)
-        
-        df = pd.DataFrame(current_data, columns=[f'Current {ch}'])
+    # Concatenate results
+    intensity = np.concatenate([r['intensity'] for r in results], axis=0)
+    com_y = np.concatenate([r['com_y'] for r in results], axis=0)
+    com_x = np.concatenate([r['com_x'] for r in results], axis=0)
+    times = np.concatenate([r['times'] for r in results], axis=0)
 
-    elif custom_proc is not None:
+    data_array = np.concatenate([
+        times[:, np.newaxis],
+        intensity[:, np.newaxis],
+        com_y[:, np.newaxis],
+        com_x[:, np.newaxis]
+    ], axis=1)
 
-        return 'Custom data processing needs to be ran previously.'
-    
+    df = pd.DataFrame(data_array, columns=['Timestamp',
+                                        'Intensity',
+                                        'COM_Y',
+                                        'COM_X'])
+
     # # Temporary correction for ghost frame implemented by the xpress3 for ME7 and RAYSPEC. This should be removed once the issue is fixed at the source.
     # if detector.upper() == 'ME7' or detector.upper() == 'RAYSPEC':
     #     with File(files[0], "r") as f:
@@ -331,65 +187,201 @@ def process_detector_data(scanno,
     save_dir = os.path.dirname(processed_path)
     os.makedirs(save_dir, exist_ok=True)
 
-    # Save to HDF5 (multiple ROIs/channels for this detector share one file,
-    # each living in its own subgroup under entry/data)
-    if roi is not None:
-        with File(processed_path, 'a') as f:
-            entry = f.require_group('entry')
-            entry.attrs['NX_class'] = 'NXentry'
-            f.require_group('entry/data')
+    # Save to HDF5 (multiple ROIs for this detector share one file, each
+    # living in its own subgroup under entry/data)
+    with File(processed_path, 'a') as f:
+        entry = f.require_group('entry')
+        entry.attrs['NX_class'] = 'NXentry'
+        f.require_group('entry/data')
 
-            if group_path in f:
-                del f[group_path]
-            nxdata = f.create_group(group_path)
-            nxdata.attrs['NX_class']   = 'NXdata'
-            nxdata.attrs['signal']     = 'Intensity'
-            nxdata.attrs['axes']       = 'Timestamp'
-            nxdata.attrs['auxiliary_signals'] = ['COM_Y', 'COM_X']
-            nxdata.attrs['roi_name']   = roi.name
-            nxdata.attrs['roi_y_start'] = roi.y_start
-            nxdata.attrs['roi_y_end']   = roi.y_end
-            nxdata.attrs['roi_x_start'] = roi.x_start
-            nxdata.attrs['roi_x_end']   = roi.x_end
+        if group_path in f:
+            del f[group_path]
+        nxdata = f.create_group(group_path)
+        nxdata.attrs['NX_class']   = 'NXdata'
+        nxdata.attrs['signal']     = 'Intensity'
+        nxdata.attrs['axes']       = 'Timestamp'
+        nxdata.attrs['auxiliary_signals'] = ['COM_Y', 'COM_X']
+        nxdata.attrs['roi_name']   = roi.name
+        nxdata.attrs['roi_y_start'] = roi.y_start
+        nxdata.attrs['roi_y_end']   = roi.y_end
+        nxdata.attrs['roi_x_start'] = roi.x_start
+        nxdata.attrs['roi_x_end']   = roi.x_end
 
-            nxdata.create_dataset('Timestamp', data=df['Timestamp'].values)
-            ds = nxdata.create_dataset('Intensity', data=df['Intensity'].values)
-            ds.attrs['long_name'] = 'ROI Intensity'
-            nxdata.create_dataset('COM_Y', data=df['COM_Y'].values)
-            nxdata.create_dataset('COM_X', data=df['COM_X'].values)
+        nxdata.create_dataset('Timestamp', data=df['Timestamp'].values)
+        ds = nxdata.create_dataset('Intensity', data=df['Intensity'].values)
+        ds.attrs['long_name'] = 'ROI Intensity'
+        nxdata.create_dataset('COM_Y', data=df['COM_Y'].values)
+        nxdata.create_dataset('COM_X', data=df['COM_X'].values)
 
-        # Generating external link in master file
-        master_path = path + f'/Scan_{scanno:04d}.h5'
-        with File(master_path, 'a') as f:
-            if f'entry/data/{detector.upper()}/Processed Data/{roi.name}' in f:
-                del f[f'entry/data/{detector.upper()}/Processed Data/{roi.name}']
-            f[f'entry/data/{detector.upper()}/Processed Data/{roi.name}'] = ExternalLink(processed_path, group_path)
-
-
-    elif ch is not None:
-        with File(processed_path, 'a') as f:
-            entry = f.require_group('entry')
-            entry.attrs['NX_class'] = 'NXentry'
-            f.require_group('entry/data')
-
-            if group_path in f:
-                del f[group_path]
-            nxdata = f.create_group(group_path)
-            nxdata.attrs['NX_class'] = 'NXdata'
-            nxdata.attrs['signal']   = f'Current {ch}'
-
-            ds = nxdata.create_dataset(f'Current {ch}', data=df[f'Current {ch}'].values)
-            ds.attrs['units']     = 'nA'
-            ds.attrs['long_name'] = f'Tetramm channel {ch} current'
-
-        # Generating external link in master file
-        master_path = path + f'/Scan_{scanno:04d}.h5'
-        with File(master_path, 'a') as f:
-            if f'entry/data/{detector.upper()}/Current {ch}' in f:
-                del f[f'entry/data/{detector.upper()}/Current {ch}']
-            f[f'entry/data/{detector.upper()}/Current {ch}'] = ExternalLink(processed_path, group_path)
+    # Generating external link in master file
+    master_path = path + f'/Scan_{scanno:04d}.h5'
+    with File(master_path, 'a') as f:
+        if f'entry/data/{detector.upper()}/Processed Data/{roi.name}' in f:
+            del f[f'entry/data/{detector.upper()}/Processed Data/{roi.name}']
+        f[f'entry/data/{detector.upper()}/Processed Data/{roi.name}'] = ExternalLink(processed_path, group_path)
 
     return df
+
+
+def process_tetramm_data(scanno,
+                          detector,
+                          ch=None,
+                          path=None,
+                          n_workers=None,
+                          replace=False):
+    '''
+    Loads processed Tetramm current data from flyscan HDF5 files using
+    parallel processing. Returns a DataFrame with one 'Current {ch}' column
+    per requested channel. Each raw file is opened only once per worker, even
+    when several channels are requested, and already-cached channels are read
+    back from the processed file instead of being reprocessed.
+
+    Parameters:
+    - scanno: Scan number (int)
+    - detector: Detector name (str). Must be a member of the 'tetramm' family,
+        e.g. 'tetramm', 'tetramm1', 'tetramm2'.
+    - ch: Channel number (int), a list/tuple of channel numbers, or None.
+        Channels must be integers between 1 and 4. If None (default), all
+        four channels (1, 2, 3, 4) are processed.
+    - path: Path to data files (str)
+    - n_workers: Number of parallel workers (int, optional).
+                 Defaults to cpu_count() - 1
+    '''
+
+    path = get_path(path)
+
+    if ch is None:
+        channels = [1, 2, 3, 4]
+    elif isinstance(ch, (list, tuple)):
+        channels = list(ch)
+    else:
+        channels = [ch]
+
+    for c in channels:
+        if not isinstance(c, int) or c < 1 or c > 4:
+            raise ValueError(
+                f"Tetramm channel numbers must be integers between 1 and 4, got {c!r}."
+            )
+
+    processed_path = path + f'/Processed/Scan_{scanno:04d}/{detector.lower()}.h5'
+
+    # Split into channels already cached (loaded back from the processed
+    # file) and channels that still need to be extracted from the raw files.
+    cached = {}
+    to_process = []
+    if not replace and os.path.exists(processed_path):
+        with File(processed_path, 'r') as f:
+            for c in channels:
+                group_path = f'entry/data/channel_{c}'
+                if group_path in f:
+                    cached[c] = pd.DataFrame({f'Current {c}': f[f'{group_path}/Current {c}'][:]})
+                else:
+                    to_process.append(c)
+    else:
+        to_process = list(channels)
+
+    if to_process:
+        files = file_names(scanno, detector, path)
+
+        # Determine number of workers
+        if n_workers is None:
+            n_workers = max(1, cpu_count() - 1)
+
+        # Each worker opens a file once and extracts every requested channel
+        # from it in one read (see process_tetramm_file).
+        process_func = partial(process_tetramm_file, channels=to_process)
+
+        # Process files in parallel
+        with Pool(processes=n_workers) as pool:
+            results = pool.map(process_func, files)
+
+        processed = {}
+        for c in to_process:
+            current_data = np.concatenate([r[f'Current {c}'] for r in results], axis=0)
+            processed[c] = pd.DataFrame(current_data, columns=[f'Current {c}'])
+
+        # Ensure processed directory exists
+        save_dir = os.path.dirname(processed_path)
+        os.makedirs(save_dir, exist_ok=True)
+
+        with File(processed_path, 'a') as f:
+            entry = f.require_group('entry')
+            entry.attrs['NX_class'] = 'NXentry'
+            f.require_group('entry/data')
+
+            for c in to_process:
+                group_path = f'entry/data/channel_{c}'
+                if group_path in f:
+                    del f[group_path]
+                nxdata = f.create_group(group_path)
+                nxdata.attrs['NX_class'] = 'NXdata'
+                nxdata.attrs['signal']   = f'Current {c}'
+
+                ds = nxdata.create_dataset(f'Current {c}', data=processed[c][f'Current {c}'].values)
+                ds.attrs['units']     = 'nA'
+                ds.attrs['long_name'] = f'Tetramm channel {c} current'
+
+        # Generating external links in master file
+        master_path = path + f'/Scan_{scanno:04d}.h5'
+        with File(master_path, 'a') as f:
+            for c in to_process:
+                group_path = f'entry/data/channel_{c}'
+                link_path = f'entry/data/{detector.upper()}/Current {c}'
+                if link_path in f:
+                    del f[link_path]
+                f[link_path] = ExternalLink(processed_path, group_path)
+
+        cached.update(processed)
+
+    return pd.concat([cached[c] for c in channels], axis=1)
+
+
+def process_detector_data(scanno,
+                     detector,
+                     roi=None,
+                     ch=None,
+                     path=None,
+                     n_workers=None,
+                     replace=False,
+                     roi_override=False):
+    '''
+    Dispatches to the appropriate per-detector processing function based on
+    the detector name, and returns whatever that function returns.
+
+    - ROI detectors ('me7', 'xrd', 'ptycho', 'rayspec') are routed to
+      process_roi_data (Nx4 DataFrame: Timestamp, Intensity, COM_Y, COM_X).
+    - Tetramm-family detectors ('tetramm', 'tetramm1', 'tetramm2', ...) are
+      routed to process_tetramm_data (a DataFrame with one 'Current {ch}'
+      column per requested channel).
+    - Any other detector name returns a message stating it is not yet
+      supported, instead of raising.
+
+    Parameters:
+    - scanno: Scan number (int)
+    - detector: Detector name (str).
+    - roi: Region of interest defined from roi_utils.py as
+        roiN = roi(y_start, y_end, x_start, x_end, name="roiN")
+    - ch: Tetramm channel number (int), a list/tuple of channel numbers
+        (each between 1 and 4), or None to process all four channels.
+        Only meaningful for tetramm-family detectors.
+    - path: Path to data files (str)
+    - n_workers: Number of parallel workers (int, optional).
+                 Defaults to cpu_count() - 1
+    '''
+
+    ROI_DETECTORS = {'xrd', 'ptycho', 'me7', 'rayspec'}
+
+    detector_key = detector.lower()
+
+    if detector_key in ROI_DETECTORS:
+        return process_roi_data(scanno, detector, roi=roi, path=path,
+                                 n_workers=n_workers, replace=replace,
+                                 roi_override=roi_override)
+    elif detector_key.startswith('tetramm'):
+        return process_tetramm_data(scanno, detector, ch=ch, path=path,
+                                     n_workers=n_workers, replace=replace)
+    else:
+        return f"Detector '{detector}' is not yet supported."
 
 
 def process_position_data(scanno, 
@@ -585,13 +577,7 @@ def mesh_detector_data(scanno,
         X = X * 1e-3 + xi + xmin
         Y = Y * -1e-3 + yi
 
-    # Save X, Y, Z to master file. X and Y are regular (separable) meshgrids
-    # -- X varies only along columns, Y only along rows -- so per NeXus
-    # convention the axes are stored as their underlying 1-D vectors (length
-    # matching the corresponding Z dimension), not as full 2-D grids. NXdata
-    # viewers (e.g. H5Web) expect rank-1 axis datasets unless an explicit
-    # AXISNAME_indices attribute says otherwise; storing full 2-D grids here
-    # is what was making the images render incorrectly.
+    # For master file saving with neXus structure.
     x_axis = X[0, :]
     y_axis = Y[:, 0]
 

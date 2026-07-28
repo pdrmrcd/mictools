@@ -4,6 +4,43 @@ from .config import get_analysis_path, get_path_or_none
 
 REGISTRY_FILENAME = "roi_registry.yaml"
 
+def _resolve_roi(roi, path, register=False, override=False):
+    '''
+    Normalize the ``roi`` argument to a :class:`Roi` (or ``None``) via the registry.
+
+    Accepts either a :class:`Roi` instance or a registered ROI **name** (str):
+
+    - ``None`` -> ``None`` (channel/current mode).
+    - ``str``  -> looked up in the experiment's ROI registry (``ValueError`` if unknown).
+    - ``Roi``  -> validated; a falsy name is rejected (guards ``Scan_XXXX_None.h5``).
+                  If its name is already registered with a *different* geometry,
+                  raise ``ValueError`` unless ``override=True`` (this is what closes
+                  the silent stale-cache collision, since caching keys on name).
+                  When ``register=True`` the ROI is added to the registry so its
+                  usage can be tracked.
+    '''
+    if roi is None:
+        return None
+    if isinstance(roi, str):
+        return RoiRegistry.load(path).get(roi)
+    if not isinstance(roi, ROI):
+        raise ValueError(
+            "roi must be a Roi instance (roi_utils.Roi) or a registered ROI name (str)."
+        )
+    if not roi.name:
+        raise ValueError(
+            "roi.name must be set (it is used to build HDF5 group paths)."
+        )
+    reg = RoiRegistry.load(path)
+    if roi.name in reg.names() and not reg.get(roi.name).same_geometry(roi) and not override:
+        raise ValueError(
+            f"ROI name {roi.name!r} is already registered with a different geometry "
+            f"{reg.get(roi.name).as_tuple()}. Pass roi_override=True to replace it "
+            f"(the previous definition and its scan list are archived), or use a new name."
+        )
+    if register:
+        reg.add(roi, override=override)
+    return roi
 
 def _validate_name(name):
     '''
