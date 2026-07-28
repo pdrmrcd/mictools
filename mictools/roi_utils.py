@@ -9,10 +9,10 @@ def _validate_name(name):
     '''
     Validate an ROI name for use as a registry key and a path component.
 
-    ROI names are interpolated raw into filenames and HDF5 group paths
-    (e.g. ``Scan_0042_{name}.h5``, ``.../Images/{name}``), so a ``None``,
-    empty, or path-hostile name silently corrupts outputs. Raise ``ValueError``
-    if the name is unusable; return the name otherwise.
+    ROI names are interpolated raw into HDF5 group paths (e.g.
+    ``entry/data/{name}``, ``.../Images/{name}``), so a ``None``, empty, or
+    path-hostile name silently corrupts outputs. Raise ``ValueError`` if the
+    name is unusable; return the name otherwise.
     '''
     if not isinstance(name, str) or not name.strip():
         raise ValueError(f"ROI name must be a non-empty string, got {name!r}.")

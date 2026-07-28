@@ -3,6 +3,9 @@ import os
 _default_path = None
 
 def set_path(path):
+    '''Set the default data root for the current session. It must point to the 'data' directory 
+    of a given experiment. This is used by :func:`get_path` to resolve the default data root 
+    when ``path=None`` is passed.'''
     global _default_path
     _default_path = path
 

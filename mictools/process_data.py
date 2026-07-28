@@ -40,7 +40,7 @@ def _resolve_roi(roi, path, register=False, override=False):
         )
     if not roi.name:
         raise ValueError(
-            "roi.name must be set (it is used to build filenames and HDF5 paths)."
+            "roi.name must be set (it is used to build HDF5 group paths)."
         )
     reg = RoiRegistry.load(path)
     if roi.name in reg.names() and not reg.get(roi.name).same_geometry(roi) and not override:
@@ -90,16 +90,14 @@ def process_roi_file(file, roi):
         tset = f["entry/instrument/NDAttributes/NDArrayTimeStamp"]
         times = tset[:]
 
-        # # Temporary correction for ghost frame implemented by the xpress3
+        # Temporary correction for ghost frame implemented by the xpress3
 
-        # if f["entry/instrument/NDAttributes/NDArrayUniqueId"][0] == -1:
-        #     intensity = intensity[1:]
-        #     com_y = com_y[1:]
-        #     com_x = com_x[1:]
-        #     times = times[1:]
+        if f["entry/instrument/NDAttributes/NDArrayUniqueId"][0] == -1:
+            intensity = intensity[1:]
+            com_y = com_y[1:]
+            com_x = com_x[1:]
+            times = times[1:]
 
-    
-    
     return {
         'intensity': intensity,
         'com_y': com_y,
@@ -247,19 +245,23 @@ def process_detector_data(scanno,
 
     # Check if processed data already exists
     if roi is not None:
-        processed_path = path + f'/Processed/{detector.upper()}/Scan_{scanno:04d}_{roi.name}.h5'
+        processed_path = path + f'/Processed/Scan_{scanno:04d}/{detector.lower()}.h5'
+        group_path = f'entry/data/{roi.name}'
         if os.path.exists(processed_path) and not replace:
             with File(processed_path, 'r') as f:
-                data = {key: f[f'entry/data/{key}'][:] for key in f[f'entry/data'].keys()}
-            return pd.DataFrame(data)
+                if group_path in f:
+                    data = {key: f[f'{group_path}/{key}'][:] for key in f[group_path].keys()}
+                    return pd.DataFrame(data)
     elif ch is not None:
-        processed_path = path + f'/Processed/{detector.upper()}/Scan_{scanno:04d}_channel_{ch}.h5'
+        processed_path = path + f'/Processed/Scan_{scanno:04d}/{detector.lower()}.h5'
+        group_path = f'entry/data/channel_{ch}'
         if os.path.exists(processed_path) and not replace:
             with File(processed_path, 'r') as f:
-                current = f[f'entry/data/Current {ch}'][:]
-            return pd.DataFrame({f'Current {ch}': current})
+                if group_path in f:
+                    current = f[f'{group_path}/Current {ch}'][:]
+                    return pd.DataFrame({f'Current {ch}': current})
     elif custom_proc is not None:
-        processed_path = path + f'/Processed/{detector.upper()}/Scan_{scanno:04d}_{custom_proc}.h5'
+        processed_path = path + f'/Processed/Scan_{scanno:04d}/{detector.lower()}.h5'
     
     # Data processing
 
@@ -319,26 +321,31 @@ def process_detector_data(scanno,
 
         return 'Custom data processing needs to be ran previously.'
     
-    # Temporary correction for ghost frame implemented by the xpress3 for ME7 and RAYSPEC. This should be removed once the issue is fixed at the source.
-    if detector.upper() == 'ME7' or detector.upper() == 'RAYSPEC':
-        with File(files[0], "r") as f:
-            if f['entry/instrument/NDAttributes/NDArrayUniqueId'][0] == -1:
-                df = df.iloc[1:].reset_index(drop=True)
+    # # Temporary correction for ghost frame implemented by the xpress3 for ME7 and RAYSPEC. This should be removed once the issue is fixed at the source.
+    # if detector.upper() == 'ME7' or detector.upper() == 'RAYSPEC':
+    #     with File(files[0], "r") as f:
+    #         if f['entry/instrument/NDAttributes/NDArrayUniqueId'][0] == -1:
+    #             df = df.iloc[1:].reset_index(drop=True)
 
     # Ensure processed directory exists
     save_dir = os.path.dirname(processed_path)
     os.makedirs(save_dir, exist_ok=True)
 
-    # Save to HDF5
+    # Save to HDF5 (multiple ROIs/channels for this detector share one file,
+    # each living in its own subgroup under entry/data)
     if roi is not None:
-        with File(processed_path, 'w') as f:
-            entry = f.create_group('entry')
+        with File(processed_path, 'a') as f:
+            entry = f.require_group('entry')
             entry.attrs['NX_class'] = 'NXentry'
+            f.require_group('entry/data')
 
-            nxdata = entry.create_group('data')
+            if group_path in f:
+                del f[group_path]
+            nxdata = f.create_group(group_path)
             nxdata.attrs['NX_class']   = 'NXdata'
             nxdata.attrs['signal']     = 'Intensity'
             nxdata.attrs['axes']       = 'Timestamp'
+            nxdata.attrs['auxiliary_signals'] = ['COM_Y', 'COM_X']
             nxdata.attrs['roi_name']   = roi.name
             nxdata.attrs['roi_y_start'] = roi.y_start
             nxdata.attrs['roi_y_end']   = roi.y_end
@@ -356,15 +363,18 @@ def process_detector_data(scanno,
         with File(master_path, 'a') as f:
             if f'entry/data/{detector.upper()}/Processed Data/{roi.name}' in f:
                 del f[f'entry/data/{detector.upper()}/Processed Data/{roi.name}']
-            f[f'entry/data/{detector.upper()}/Processed Data/{roi.name}'] = ExternalLink(processed_path, 'entry/data')
+            f[f'entry/data/{detector.upper()}/Processed Data/{roi.name}'] = ExternalLink(processed_path, group_path)
 
 
     elif ch is not None:
-        with File(processed_path, 'w') as f:
-            entry = f.create_group('entry')
+        with File(processed_path, 'a') as f:
+            entry = f.require_group('entry')
             entry.attrs['NX_class'] = 'NXentry'
+            f.require_group('entry/data')
 
-            nxdata = entry.create_group('data')
+            if group_path in f:
+                del f[group_path]
+            nxdata = f.create_group(group_path)
             nxdata.attrs['NX_class'] = 'NXdata'
             nxdata.attrs['signal']   = f'Current {ch}'
 
@@ -377,8 +387,8 @@ def process_detector_data(scanno,
         with File(master_path, 'a') as f:
             if f'entry/data/{detector.upper()}/Current {ch}' in f:
                 del f[f'entry/data/{detector.upper()}/Current {ch}']
-            f[f'entry/data/{detector.upper()}/Current {ch}'] = ExternalLink(processed_path, 'entry/data')
-        
+            f[f'entry/data/{detector.upper()}/Current {ch}'] = ExternalLink(processed_path, group_path)
+
     return df
 
 
@@ -398,7 +408,7 @@ def process_position_data(scanno,
     path = get_path(path)
 
     # Check if processed data already exists
-    processed_path = path + f'/Processed/SOCKETSERVER/Scan_{scanno:04d}_position.h5'
+    processed_path = path + f'/Processed/Scan_{scanno:04d}/position.h5'
     if os.path.exists(processed_path) and not replace:
         with File(processed_path, 'r') as f:
             triggers   = f['entry/data/Trigger'][:]
@@ -448,10 +458,10 @@ def process_position_data(scanno,
     df['Y_Position'] = df['Y_Position'] - df['Y_Position'].iloc[0]
     
     # Ensure processed directory exists
-    processed_dir = path + f'/Processed/SOCKETSERVER'
+    processed_dir = os.path.dirname(processed_path)
     os.makedirs(processed_dir, exist_ok=True)
 
-    h5_path = processed_dir + f'/Scan_{scanno:04d}_position.h5'
+    h5_path = processed_path
     with File(h5_path, 'w') as f:
         entry = f.create_group('entry')
         entry.attrs['NX_class'] = 'NXentry'
@@ -481,98 +491,7 @@ def process_position_data(scanno,
     
     return df
 
-# def mesh_detector_data(scanno, 
-#                        detector, 
-#                        roi=None, 
-#                        roi_type="Intensity", 
-#                        ch=None, 
-#                        th=None, 
-#                        path=None,
-#                        norm_detector=False,
-#                        norm_ch=None,
-#                        abs_pos=True,
-#                        replace=False):
-
-#     path = get_path(path)
-#     master_path = path + f'/Scan_{scanno:04d}.h5'
-
-#     # Define image group path and processed data path based on roi or channel
-#     if roi is not None:
-#         images_path = f'entry/data/{detector.upper()}/{roi.name}/images'
-#         processed_path = path + f'/Processed/{detector.upper()}/Scan_{scanno:04d}_{roi.name}.h5'
-#     elif ch is not None:
-#         images_path = f'entry/data/{detector.upper()}/channel_{ch}/images'
-#         processed_path = path + f'/Processed/{detector.upper()}/Scan_{scanno:04d}_channel_{ch}.h5'
-
-#     # # Return cached result if available and replace is False
-#     # if not replace:
-#     #     with File(master_path, 'r') as f:
-#     #         if f.get(images_path) is not None:
-#     #             X = f[images_path]['X'][:]
-#     #             Y = f[images_path]['Y'][:]
-#     #             Z = f[images_path]['Z'][:]
-#     #             return X, Y, Z
-
-#     # Load the data
-#     if th is None:
-#         baseline_data = load_scan(scanno, stream='baseline', path=path)
-#         th = baseline_data['sample_theta'].mean()
-#     position_data = process_position_data(scanno, th=th, path=path, replace=replace)
-#     detector_data = process_detector_data(scanno, detector, roi=roi, ch=ch, path=path, replace=replace)
-#     if norm_detector:
-#         if not norm_ch:
-#             norm_ch = 1
-#         norm_data = process_detector_data(scanno, norm_detector, ch=norm_ch, path=path, replace=replace)
-#         detector_data = detector_data / norm_data
-
-#     # Align lengths
-#     min_len = min(len(detector_data), len(position_data))
-#     position_data = position_data[:min_len]
-#     if roi is not None:
-#         detector_data = detector_data[roi_type][:min_len]
-#     elif ch is not None:
-#         detector_data = detector_data[f'Current {ch}'][:min_len]
-
-#     scan_info = get_scan_info(scanno, detector, path)
-#     ny, nx = scan_info['shape']
-
-#     x = np.linspace(position_data['X_Position'].min(), position_data['X_Position'].max(), nx)
-#     y = np.linspace(position_data['Y_Position'].min(), position_data['Y_Position'].max(), ny)
-#     X, Y = np.meshgrid(x, y)
-
-#     if abs_pos:
-#         scan_info = get_scan_info(scanno, detector, path)
-#         xi = scan_info['xi']
-#         yi = scan_info['yi']
-#         xmin = scan_info['x_min'] * 1e-3
-#         X = X * 1e-3 + xi + xmin
-#         Y = Y * -1e-3 + yi
-
-#     # Interpolate onto grid
-#     pts = position_data[['X_Position', 'Y_Position']].values
-#     data_pts = detector_data.values
-#     Z_linear = griddata(pts, data_pts, (X, Y), method='linear')
-#     Z_nearest = griddata(pts, data_pts, (X, Y), method='nearest')
-
-#     # Fill gaps outside convex hull using nearest neighbor
-#     Z = np.where(np.isnan(Z_linear), Z_nearest, Z_linear)
-
-#     # # Save X, Y, Z to master file
-#     # with File(master_path, 'a') as f:
-#     #     if f.get(images_path) is not None:
-#     #         del f[images_path]
-#     #     nximages = f.require_group(images_path)
-#     #     nximages.attrs['NX_class']       = 'NXdata'
-#     #     nximages.attrs['signal']         = 'Z'
-#     #     nximages.attrs['axes']           = ['Y', 'X']
-#     #     nximages.attrs['parent_dataset'] = processed_path
-#     #     nximages.create_dataset('X', data=X)
-#     #     nximages.create_dataset('Y', data=Y)
-#     #     nximages.create_dataset('Z', data=Z)
-
-#     return X, Y, Z
-
-def mesh_detector_data(scanno, 
+def mesh_detector_data(scanno,
                        detector, 
                        roi=None, 
                        roi_type="Intensity", 
@@ -598,11 +517,13 @@ def mesh_detector_data(scanno,
     # Define image group path and processed data path based on roi or channel
     if roi is not None:
         RoiRegistry.load(path).record_usage(roi.name, scanno)
-        images_path = f'entry/data/{detector.upper()}/Images/{roi.name}'
-        processed_path = path + f'/Processed/{detector.upper()}/Scan_{scanno:04d}_{roi.name}.h5'
+        images_path = f'entry/data/{detector.upper()}/Images/{roi.name}_{roi_type}'
+        processed_path = path + f'/Processed/Scan_{scanno:04d}/{detector.lower()}.h5'
+        parent_dataset = f'{processed_path}::entry/data/{roi.name}/{roi_type}'
     elif ch is not None:
         images_path = f'entry/data/{detector.upper()}/Images/channel_{ch}'
-        processed_path = path + f'/Processed/{detector.upper()}/Scan_{scanno:04d}_channel_{ch}.h5'
+        processed_path = path + f'/Processed/Scan_{scanno:04d}/{detector.lower()}.h5'
+        parent_dataset = f'{processed_path}::entry/data/channel_{ch}'
 
     if th is None:
         baseline_data = load_scan(scanno, stream='baseline', path=path)
@@ -664,7 +585,15 @@ def mesh_detector_data(scanno,
         X = X * 1e-3 + xi + xmin
         Y = Y * -1e-3 + yi
 
-    # Save X, Y, Z to master file
+    # Save X, Y, Z to master file. X and Y are regular (separable) meshgrids
+    # -- X varies only along columns, Y only along rows -- so per NeXus
+    # convention the axes are stored as their underlying 1-D vectors (length
+    # matching the corresponding Z dimension), not as full 2-D grids. NXdata
+    # viewers (e.g. H5Web) expect rank-1 axis datasets unless an explicit
+    # AXISNAME_indices attribute says otherwise; storing full 2-D grids here
+    # is what was making the images render incorrectly.
+    x_axis = X[0, :]
+    y_axis = Y[:, 0]
 
     with File(master_path, 'a') as f:
         if f.get(images_path) is not None:
@@ -673,9 +602,11 @@ def mesh_detector_data(scanno,
         nximages.attrs['NX_class']       = 'NXdata'
         nximages.attrs['signal']         = 'Z'
         nximages.attrs['axes']           = ['Y', 'X']
-        nximages.attrs['parent_dataset'] = processed_path
-        nximages.create_dataset('X', data=X)
-        nximages.create_dataset('Y', data=Y)
+        nximages.attrs['parent_dataset'] = parent_dataset
+        if roi is not None:
+            nximages.attrs['roi_type'] = roi_type
+        nximages.create_dataset('X', data=x_axis)
+        nximages.create_dataset('Y', data=y_axis)
         nximages.create_dataset('Z', data=Z)
 
     return X, Y, Z

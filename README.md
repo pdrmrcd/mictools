@@ -51,10 +51,10 @@ Versioning is handled by `setuptools-scm` (derived from git tags).
 
 > [!WARNING]
 > A few imported packages are **not yet declared** in `pyproject.toml`
-> (`plotly`, `lmfit`, `ipywidgets`, `pyyaml`). Until that is fixed you may need
+> (`plotly`, `lmfit`, `ipywidgets`). Until that is fixed you may need
 > to install them manually:
 > ```bash
-> pip install plotly lmfit ipywidgets pyyaml
+> pip install plotly lmfit ipywidgets
 > ```
 
 ---
@@ -178,7 +178,7 @@ trigger:
 3. Drop the first trigger (no detector data).
 4. Convert interferometer counts to **microns**, zero to the first trigger
    (origin), and flip the X sign.
-5. Save to `Processed/SOCKETSERVER/Scan_XXXX_position.h5` and link into the
+5. Save to `Processed/Scan_XXXX/position.h5` and link into the
    master file at `entry/data/Position`.
 
 > [!NOTE]
@@ -235,14 +235,44 @@ When a map is produced from an ROI, the ROI geometry is saved as attributes on
 the processed file (`roi_name`, `roi_y_start/end`, `roi_x_start/end`) so the map
 records how it was made.
 
+#### ROI registry
+
+A per-experiment, writable **ROI registry** lets you define ROIs once and reuse
+them across scans. It is a **YAML sidecar** at
+`{data_root}/analysis/roi_registry.yaml` (created on first write), managed by
+[`RoiRegistry`](mictools/roi_utils.py):
+
+```python
+from mictools.roi_utils import Roi, RoiRegistry
+from mictools.plot_data import plot_flyscan
+
+# Define an ROI once (names must be unique within the experiment)
+reg = RoiRegistry.load()
+reg.add(Roi(y_start=100, y_end=200, x_start=150, x_end=250, name="roi1"))
+
+# Reuse it across scans by name — the pipeline resolves it from the registry
+plot_flyscan(scanno=42, detector="me7", roi="roi1")
+plot_flyscan(scanno=43, detector="me7", roi="roi1")
+```
+
+- **Unique names.** Re-adding a name with the *same* geometry is a no-op.
+  Re-adding it with a *different* geometry raises unless you pass
+  `override=True` (to `RoiRegistry.add`) or `roi_override=True` (to
+  `plot_flyscan`/`mesh_detector_data`).
+- **Override keeps history.** On override, the previous definition — together
+  with the list of scans already processed with it — is archived under
+  `history` in the YAML, so prior maps remain traceable.
+- **Usage is push-tracked.** Each time a map is produced for an ROI,
+  `mesh_detector_data` records the scan number under that ROI's `used_by_scans`.
+- Passing a raw `Roi` object still works and is registered on first use; a name
+  clash with a different geometry is rejected (this closes a stale-cache hole,
+  since processed results are cached by `roi.name`).
+
 > [!NOTE]
-> **Planned:** a per-experiment, writable **ROI registry** stored as a **YAML
-> sidecar in the experiment's `analysis/` folder**, where users define ROIs once
-> and reuse them across scans. Today ROIs are created ad hoc in code/notebooks.
-> ROI **names must be unique**, but the user may **override** a duplicate name;
-> on override, the registry records the list of scans in the current experiment
-> already processed with the previously-defined ROI, so prior maps remain
-> traceable. See [Roadmap](#roadmap--not-yet-implemented).
+> The registry (`analysis/`) holds **human-curated** artifacts and is kept
+> separate from the machine-written `Raw/` and `Processed/` trees. `pyyaml` is
+> imported lazily, so importing the pipeline never requires it — but it is now a
+> declared dependency.
 
 ### 5. Derived arrays and provenance
 
@@ -319,20 +349,26 @@ Relative to the data root (`get_path()`):
 │   └── Scan_{scanno:04d}/
 │       ├── {DETECTOR}/scan_{scanno:04d}_*.h5               # raw detector frames (multi-file)
 │       └── SOCKETSERVER/scan_{scanno:04d}_*.h5             # clocks + interferometry
-└── Processed/
-    ├── {DETECTOR}/Scan_{scanno:04d}_{roi.name}.h5          # processed ROI
-    ├── {DETECTOR}/Scan_{scanno:04d}_channel_{ch}.h5        # processed Tetramm channel
-    └── SOCKETSERVER/Scan_{scanno:04d}_position.h5          # processed positions
+├── Processed/
+│   └── Scan_{scanno:04d}/
+│       ├── position.h5                                     # processed positions
+│       └── {detector}.h5                                   # ALL ROIs + channels for one
+│                                                             #   detector, as sibling groups
+│                                                             #   under entry/data/{roi.name |
+│                                                             #   channel_ch}
+└── analysis/
+    └── roi_registry.yaml                                   # human-curated ROI registry
 ```
 
-Master-file external links:
+Master-file external links (unchanged target names in `Scan_XXXX.h5`; only the
+source file + internal group changed, per above):
 
-| Data | Link path in `Scan_XXXX.h5` |
-|---|---|
-| Positions | `entry/data/Position` |
-| ROI results | `entry/data/{DETECTOR}/Processed Data/{roi.name}` |
-| Channel current | `entry/data/{DETECTOR}/Current {ch}` |
-| Meshed maps | `entry/data/{DETECTOR}/Images/{roi.name \| channel_ch}` |
+| Data | Link path in `Scan_XXXX.h5` | Source |
+|---|---|---|
+| Positions | `entry/data/Position` | `Processed/Scan_XXXX/position.h5::entry/data` |
+| ROI results | `entry/data/{DETECTOR}/Processed Data/{roi.name}` | `Processed/Scan_XXXX/{detector}.h5::entry/data/{roi.name}` |
+| Channel current | `entry/data/{DETECTOR}/Current {ch}` | `Processed/Scan_XXXX/{detector}.h5::entry/data/channel_{ch}` |
+| Meshed maps | `entry/data/{DETECTOR}/Images/{roi.name \| channel_ch}` | written directly (no source file) |
 
 Key raw-file HDF5 paths: frames `entry/data/data`; timestamps
 `entry/instrument/NDAttributes/NDArrayTimeStamp`; ghost-frame flag
@@ -358,10 +394,14 @@ Key raw-file HDF5 paths: frames `entry/data/data`; timestamps
 The following are described in the design but **not yet built** — treated as
 planned throughout this document:
 
-- [ ] **ROI registry** — per-experiment YAML sidecar in `analysis/` holding
-      reusable ROIs; enforce unique names with an override path that logs which
-      scans already used the prior definition. Maps duplicate the ROI
-      name/geometry inline for full reproducibility.
+- [x] **ROI registry** — per-experiment YAML sidecar in `analysis/` holding
+      reusable ROIs; unique names with an override path that archives which scans
+      already used the prior definition. See
+      [ROIs and reproducibility](#4-rois-and-reproducibility).
+      *(Still open: duplicating the ROI name/geometry inline on the meshed-map
+      `Images/{roi.name}` group — today those maps reference the ROI via their
+      path + `parent_dataset`, and the per-ROI processed file carries the
+      geometry attributes.)*
 - [ ] **Interferometry-clock (`Counter2`) position mode** — optional finer
       position reconstruction using per-reading data instead of per-trigger
       averaging.
@@ -370,4 +410,4 @@ planned throughout this document:
 - [ ] **Real provenance links** — HDF5 links from derived arrays to parents
       (currently a `parent_dataset` string attribute only).
 - [ ] **Declare missing dependencies** in `pyproject.toml`
-      (`plotly`, `lmfit`, `ipywidgets`, `pyyaml`).
+      (`plotly`, `lmfit`, `ipywidgets`). `pyyaml` is now declared.
