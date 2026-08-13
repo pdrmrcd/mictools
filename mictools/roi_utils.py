@@ -23,7 +23,7 @@ def _resolve_roi(roi, path, register=False, override=False):
         return None
     if isinstance(roi, str):
         return RoiRegistry.load(path).get(roi)
-    if not isinstance(roi, ROI):
+    if not isinstance(roi, Roi):
         raise ValueError(
             "roi must be a Roi instance (roi_utils.Roi) or a registered ROI name (str)."
         )
@@ -62,23 +62,76 @@ def _validate_name(name):
 
 
 class Roi(object):
-    def __init__(self, y_start, y_end, x_start, x_end, name=None):
+    '''
+    A 1D, 2D, or 3D region of interest within an area-detector frame.
+
+    Dimensionality is inferred from which bound pairs are supplied: ``x_start``/
+    ``x_end`` are always required (x is the mandatory, innermost/fastest axis,
+    so a 1D ROI is x-only). Adding ``y_start``/``y_end`` makes it 2D. Adding
+    ``z_start``/``z_end`` on top of that makes it 3D (z cannot be given without
+    y - dimensions can't be skipped). Axes are ordered outer-to-inner as
+    z, y, x, matching the assumed on-disk dataset layout
+    ``(n_frames, [z,] [y,] x)`` - this is a naming convention, not something
+    verified against a real 3D fixture in this repo.
+    '''
+
+    def __init__(self, y_start=None, y_end=None, x_start=None, x_end=None, name=None,
+                 z_start=None, z_end=None):
         # Coerce bounds to int at this single choke point so downstream slicing
         # (dset[:, y_start:y_end, ...]) and YAML round-trips are always clean.
-        self.y_start = int(y_start)
-        self.y_end = int(y_end)
+        if x_start is None or x_end is None:
+            raise ValueError(
+                f"x_start and x_end are required: an Roi spans at least the x "
+                f"axis (got x_start={x_start!r}, x_end={x_end!r})."
+            )
+        if (y_start is None) != (y_end is None):
+            raise ValueError(
+                f"y_start and y_end must both be provided or both omitted, "
+                f"got y_start={y_start!r}, y_end={y_end!r}."
+            )
+        if (z_start is None) != (z_end is None):
+            raise ValueError(
+                f"z_start and z_end must both be provided or both omitted, "
+                f"got z_start={z_start!r}, z_end={z_end!r}."
+            )
+        if z_start is not None and y_start is None:
+            raise ValueError(
+                "z_start/z_end require y_start/y_end to also be provided "
+                "(an Roi cannot skip the y dimension when z is present)."
+            )
+
         self.x_start = int(x_start)
         self.x_end = int(x_end)
-        if not (0 <= self.y_start < self.y_end):
-            raise ValueError(
-                f"Invalid y bounds: require 0 <= y_start < y_end, "
-                f"got y_start={self.y_start}, y_end={self.y_end}."
-            )
         if not (0 <= self.x_start < self.x_end):
             raise ValueError(
                 f"Invalid x bounds: require 0 <= x_start < x_end, "
                 f"got x_start={self.x_start}, x_end={self.x_end}."
             )
+
+        if y_start is not None:
+            self.y_start = int(y_start)
+            self.y_end = int(y_end)
+            if not (0 <= self.y_start < self.y_end):
+                raise ValueError(
+                    f"Invalid y bounds: require 0 <= y_start < y_end, "
+                    f"got y_start={self.y_start}, y_end={self.y_end}."
+                )
+        else:
+            self.y_start = None
+            self.y_end = None
+
+        if z_start is not None:
+            self.z_start = int(z_start)
+            self.z_end = int(z_end)
+            if not (0 <= self.z_start < self.z_end):
+                raise ValueError(
+                    f"Invalid z bounds: require 0 <= z_start < z_end, "
+                    f"got z_start={self.z_start}, z_end={self.z_end}."
+                )
+        else:
+            self.z_start = None
+            self.z_end = None
+
         # name is optional at construction for backward-compat, but validated if
         # provided; presence is enforced at the registry / pipeline boundary.
         self.name = _validate_name(name) if name is not None else None
@@ -98,38 +151,72 @@ class Roi(object):
                         f"RoiRegistry.load().add(roi, override=True)."
                     )
 
+    @property
+    def ndim(self):
+        '''Number of spatial axes this ROI spans (1, 2, or 3).'''
+        if self.z_start is not None:
+            return 3
+        if self.y_start is not None:
+            return 2
+        return 1
+
+    def axis_names(self):
+        '''Axis names present, ordered outer-to-inner (e.g. ``['y', 'x']`` for a 2D ROI).'''
+        return {1: ['x'], 2: ['y', 'x'], 3: ['z', 'y', 'x']}[self.ndim]
+
+    def axis_ranges(self):
+        '''``(start, end)`` bounds for each present axis, ordered outer-to-inner.'''
+        return tuple(
+            (getattr(self, f'{n}_start'), getattr(self, f'{n}_end'))
+            for n in self.axis_names()
+        )
+
     def as_tuple(self):
-        return (self.y_start, self.y_end, self.x_start, self.x_end)
+        return tuple(v for pair in self.axis_ranges() for v in pair)
 
     def to_dict(self):
         '''Serialize the ROI to a plain dict (used by the ROI registry / YAML).'''
-        return {
-            "name": self.name,
-            "y_start": int(self.y_start),
-            "y_end": int(self.y_end),
-            "x_start": int(self.x_start),
-            "x_end": int(self.x_end),
-        }
+        d = {"name": self.name}
+        for n, (start, end) in zip(self.axis_names(), self.axis_ranges()):
+            d[f'{n}_start'] = int(start)
+            d[f'{n}_end'] = int(end)
+        return d
 
     @classmethod
     def from_dict(cls, d):
         '''Rebuild a Roi from a dict produced by :meth:`to_dict`.
 
-        Raises ``ValueError`` (not a bare ``KeyError``) if a bound key is
+        Dimensionality is inferred from which bound keys are present (``x``
+        always required; ``y`` and/or ``z`` present makes it 2D/3D). Raises
+        ``ValueError`` (not a bare ``KeyError``) if a required bound key is
         missing, since the registry YAML is hand-editable.
         '''
-        missing = [k for k in ("y_start", "y_end", "x_start", "x_end") if k not in d]
-        if missing:
+        missing_x = [k for k in ("x_start", "x_end") if k not in d]
+        if missing_x:
             raise ValueError(
-                f"ROI entry {d!r} is missing required key(s): {', '.join(missing)}."
+                f"ROI entry {d!r} is missing required key(s): {', '.join(missing_x)}."
             )
-        return cls(
-            y_start=d["y_start"],
-            y_end=d["y_end"],
-            x_start=d["x_start"],
-            x_end=d["x_end"],
-            name=d.get("name"),
-        )
+        kwargs = dict(x_start=d["x_start"], x_end=d["x_end"], name=d.get("name"))
+
+        if "y_start" in d or "y_end" in d:
+            missing_y = [k for k in ("y_start", "y_end") if k not in d]
+            if missing_y:
+                raise ValueError(
+                    f"ROI entry {d!r} is missing required key(s): {', '.join(missing_y)}."
+                )
+            kwargs["y_start"] = d["y_start"]
+            kwargs["y_end"] = d["y_end"]
+
+        if "z_start" in d or "z_end" in d:
+            missing_z = [k for k in ("z_start", "z_end") if k not in d]
+            if missing_z:
+                raise ValueError(
+                    f"ROI entry {d!r} is missing required key(s): {', '.join(missing_z)}."
+                )
+            kwargs["z_start"] = d["z_start"]
+            kwargs["z_end"] = d["z_end"]
+
+        return cls(**kwargs)
 
     @classmethod
     def _from_registry_entry(cls, d, name):
@@ -139,11 +226,14 @@ class Roi(object):
         ``get() → from_dict() → __init__() → add()`` recursion cycle.
         '''
         obj = object.__new__(cls)
-        obj.y_start = int(d["y_start"])
-        obj.y_end   = int(d["y_end"])
-        obj.x_start = int(d["x_start"])
-        obj.x_end   = int(d["x_end"])
-        obj.name    = name
+        for n in ('x', 'y', 'z'):
+            if f'{n}_start' in d:
+                setattr(obj, f'{n}_start', int(d[f'{n}_start']))
+                setattr(obj, f'{n}_end', int(d[f'{n}_end']))
+            else:
+                setattr(obj, f'{n}_start', None)
+                setattr(obj, f'{n}_end', None)
+        obj.name = name
         return obj
 
     def same_geometry(self, other):
@@ -163,10 +253,11 @@ class Roi(object):
         return hash((self.as_tuple(), self.name))
 
     def __repr__(self):
-        return (
-            f"Roi(y_start={self.y_start}, y_end={self.y_end}, "
-            f"x_start={self.x_start}, x_end={self.x_end}, name={self.name!r})"
+        bounds = ', '.join(
+            f'{n}_start={s}, {n}_end={e}'
+            for n, (s, e) in zip(self.axis_names(), self.axis_ranges())
         )
+        return f"Roi({bounds}, name={self.name!r})"
 
 
 class RoiRegistry(object):
@@ -189,6 +280,10 @@ class RoiRegistry(object):
           roi1:
             - {y_start: 90, y_end: 190, x_start: 150, x_end: 250,
                used_by_scans: [12, 13]}
+
+    ``x_start``/``x_end`` are always present. ``y_start``/``y_end`` appear for
+    2D and 3D ROIs; ``z_start``/``z_end`` appear only for 3D ROIs (see
+    :class:`Roi`).
 
     Load with :meth:`load`, mutate with :meth:`add` / :meth:`record_usage`, and
     persist with :meth:`save` (mutating methods save automatically).

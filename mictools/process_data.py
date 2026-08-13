@@ -19,36 +19,50 @@ from .roi_utils import _resolve_roi
 def process_roi_file(file, roi):
     '''
     Process a single HDF5 file and extract ROI data.
-    
+
     Parameters:
     - file: Path to HDF5 file (str)
-    - roi: Region of interest defined as (y_start, y_end, x_start, x_end)
-    
+    - roi: Region of interest (roi_utils.Roi), 1D, 2D, or 3D. The dataset's
+        spatial dimensionality (its shape excluding the leading frame axis)
+        must match roi.ndim.
+
     Returns:
-    - Dictionary containing intensity, COM positions, and timestamps
+    - Dictionary containing intensity, one 'com_{axis}' entry per axis present
+      in the roi (e.g. just 'com_x' for a 1D roi), and timestamps
     '''
-    # Create coordinate grids for the ROI
-    y_coords = np.arange(roi.y_start, roi.y_end)
-    x_coords = np.arange(roi.x_start, roi.x_end)
-    yy, xx = np.meshgrid(y_coords, x_coords, indexing='ij')
-    
+    axis_names = roi.axis_names()
+    axis_ranges = roi.axis_ranges()
+    grids = np.meshgrid(*[np.arange(s, e) for s, e in axis_ranges], indexing='ij')
+    roi_slice = (slice(None),) + tuple(slice(s, e) for s, e in axis_ranges)
+    sum_axes = tuple(range(1, roi.ndim + 1))
+
     with File(file, "r") as f:
         dset = f["entry/data/data"]
-        data_roi = dset[:, roi.y_start:roi.y_end, roi.x_start:roi.x_end]
-        
+        if dset.ndim - 1 != roi.ndim:
+            raise ValueError(
+                f"ROI dimensionality mismatch: dataset 'entry/data/data' in "
+                f"{file!r} has shape {dset.shape} ({dset.ndim - 1} spatial "
+                f"dimension(s) per frame), but roi {roi.name!r} is {roi.ndim}D "
+                f"({', '.join(axis_names)}). Use an ROI with a matching number "
+                f"of dimensions."
+            )
+        data_roi = dset[roi_slice]
+
         # Calculate total intensity for each frame
-        total_intensity = np.sum(data_roi, axis=(1, 2))
-        
+        total_intensity = np.sum(data_roi, axis=sum_axes)
+
         # Store original intensity
         intensity = total_intensity.copy()
-        
+
         # Avoid division by zero
         total_intensity = np.where(total_intensity == 0, 1, total_intensity)
-        
-        # Calculate COM using vectorized operations
-        com_y = np.sum(data_roi * yy[np.newaxis, :, :], axis=(1, 2)) / total_intensity
-        com_x = np.sum(data_roi * xx[np.newaxis, :, :], axis=(1, 2)) / total_intensity
-        
+
+        # Calculate COM using vectorized operations, one per roi axis
+        com = {
+            f'com_{n}': np.sum(data_roi * g[np.newaxis, ...], axis=sum_axes) / total_intensity
+            for n, g in zip(axis_names, grids)
+        }
+
         tset = f["entry/instrument/NDAttributes/NDArrayTimeStamp"]
         times = tset[:]
 
@@ -56,16 +70,10 @@ def process_roi_file(file, roi):
 
         if f["entry/instrument/NDAttributes/NDArrayUniqueId"][0] == -1:
             intensity = intensity[1:]
-            com_y = com_y[1:]
-            com_x = com_x[1:]
+            com = {k: v[1:] for k, v in com.items()}
             times = times[1:]
 
-    return {
-        'intensity': intensity,
-        'com_y': com_y,
-        'com_x': com_x,
-        'times': times
-    }
+    return {'intensity': intensity, 'times': times, **com}
 
 def process_tetramm_file(file, channels):
     '''
@@ -104,16 +112,17 @@ def process_roi_data(scanno,
                       roi_override=False):
     '''
     Loads processed ROI data (intensity + center of mass) from flyscan HDF5
-    files using parallel processing. Returns an Nx4 DataFrame where the first
-    column is timestamps, and the following columns are intensity in ROI,
-    COM y-position, and COM x-position.
+    files using parallel processing. Returns a DataFrame with a 'Timestamp'
+    column, an 'Intensity' column, and one 'COM_{AXIS}' column per axis
+    present in the roi (e.g. just 'COM_X' for a 1D roi, 'COM_Y'/'COM_X' for a
+    2D roi, 'COM_Z'/'COM_Y'/'COM_X' for a 3D roi).
 
     Parameters:
     - scanno: Scan number (int)
     - detector: Detector name (str). Must be an area detector such as
         'me7', 'xrd', 'ptycho', 'rayspec'.
-    - roi: Region of interest defined from roi_utils.py as
-        roiN = roi(y_start, y_end, x_start, x_end, name="roiN")
+    - roi: Region of interest defined from roi_utils.py as a 1D, 2D, or 3D
+        Roi, e.g. roiN = Roi(y_start, y_end, x_start, x_end, name="roiN")
     - path: Path to data files (str)
     - n_workers: Number of parallel workers (int, optional).
                  Defaults to cpu_count() - 1
@@ -161,21 +170,14 @@ def process_roi_data(scanno,
 
     # Concatenate results
     intensity = np.concatenate([r['intensity'] for r in results], axis=0)
-    com_y = np.concatenate([r['com_y'] for r in results], axis=0)
-    com_x = np.concatenate([r['com_x'] for r in results], axis=0)
     times = np.concatenate([r['times'] for r in results], axis=0)
 
-    data_array = np.concatenate([
-        times[:, np.newaxis],
-        intensity[:, np.newaxis],
-        com_y[:, np.newaxis],
-        com_x[:, np.newaxis]
-    ], axis=1)
+    com_columns = [f'COM_{n.upper()}' for n in roi.axis_names()]
+    data = {'Timestamp': times, 'Intensity': intensity}
+    for col, n in zip(com_columns, roi.axis_names()):
+        data[col] = np.concatenate([r[f'com_{n}'] for r in results], axis=0)
 
-    df = pd.DataFrame(data_array, columns=['Timestamp',
-                                        'Intensity',
-                                        'COM_Y',
-                                        'COM_X'])
+    df = pd.DataFrame(data)
 
     # # Temporary correction for ghost frame implemented by the xpress3 for ME7 and RAYSPEC. This should be removed once the issue is fixed at the source.
     # if detector.upper() == 'ME7' or detector.upper() == 'RAYSPEC':
@@ -200,18 +202,17 @@ def process_roi_data(scanno,
         nxdata.attrs['NX_class']   = 'NXdata'
         nxdata.attrs['signal']     = 'Intensity'
         nxdata.attrs['axes']       = 'Timestamp'
-        nxdata.attrs['auxiliary_signals'] = ['COM_Y', 'COM_X']
+        nxdata.attrs['auxiliary_signals'] = com_columns
         nxdata.attrs['roi_name']   = roi.name
-        nxdata.attrs['roi_y_start'] = roi.y_start
-        nxdata.attrs['roi_y_end']   = roi.y_end
-        nxdata.attrs['roi_x_start'] = roi.x_start
-        nxdata.attrs['roi_x_end']   = roi.x_end
+        for axis_name, (start, end) in zip(roi.axis_names(), roi.axis_ranges()):
+            nxdata.attrs[f'roi_{axis_name}_start'] = start
+            nxdata.attrs[f'roi_{axis_name}_end']   = end
 
         nxdata.create_dataset('Timestamp', data=df['Timestamp'].values)
         ds = nxdata.create_dataset('Intensity', data=df['Intensity'].values)
         ds.attrs['long_name'] = 'ROI Intensity'
-        nxdata.create_dataset('COM_Y', data=df['COM_Y'].values)
-        nxdata.create_dataset('COM_X', data=df['COM_X'].values)
+        for col in com_columns:
+            nxdata.create_dataset(col, data=df[col].values)
 
     # Generating external link in master file
     master_path = path + f'/Scan_{scanno:04d}.h5'
@@ -349,7 +350,8 @@ def process_detector_data(scanno,
     the detector name, and returns whatever that function returns.
 
     - ROI detectors ('me7', 'xrd', 'ptycho', 'rayspec') are routed to
-      process_roi_data (Nx4 DataFrame: Timestamp, Intensity, COM_Y, COM_X).
+      process_roi_data (a DataFrame with Timestamp, Intensity, and one
+      COM_{AXIS} column per axis present in the roi - see process_roi_data).
     - Tetramm-family detectors ('tetramm', 'tetramm1', 'tetramm2', ...) are
       routed to process_tetramm_data (a DataFrame with one 'Current {ch}'
       column per requested channel).
@@ -522,6 +524,11 @@ def mesh_detector_data(scanno,
         th = baseline_data['sample_theta'].mean()
     position_data = process_position_data(scanno, th=th, path=path, replace=replace)
     detector_data = process_detector_data(scanno, detector, roi=roi, ch=ch, path=path, replace=replace)
+    if roi is not None and roi_type not in detector_data.columns:
+        raise ValueError(
+            f"roi_type={roi_type!r} is not available for ROI {roi.name!r} "
+            f"(ndim={roi.ndim}); available columns: {list(detector_data.columns)}."
+        )
     if norm_detector:
         if not norm_ch:
             norm_ch=1
