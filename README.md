@@ -73,11 +73,15 @@ from mictools.plot_data import plot_flyscan
 # 1. Set the default data root (contains Scan_XXXX.h5, Raw/, Processed/)
 set_path("/data/2026-1/my_experiment")
 
-# 2. Define a region of interest on an area detector (pixel bounds + a name)
+# 2. Define a region of interest on an area detector (pixel bounds + a name).
+#    x is always required; adding y makes it 2D, adding z on top of that
+#    makes it 3D (x_start/x_end alone is a valid 1D ROI).
 roi1 = Roi(y_start=100, y_end=200, x_start=150, x_end=250, name="roi1")
 
 # 3. Process + plot a flyscan map in one call.
-#    roi_type selects which ROI scalar to map: "Intensity", "COM_X", or "COM_Y".
+#    roi_type selects which ROI scalar to map: "Intensity", "COM_X", "COM_Y",
+#    or "COM_Z" - COM_Y/COM_Z are only available when the ROI has that many
+#    dimensions (a 1D ROI only produces "Intensity"/"COM_X").
 plot_flyscan(scanno=42, detector="me7", roi=roi1, roi_type="Intensity")
 ```
 
@@ -121,8 +125,8 @@ Unless stated otherwise, the rest of this document concerns **flyscans**.
 | **SOCKETSERVER** | The DAQ process that records the FPGA clocks and interferometer readings into a labeled table (HDF5, split across files). Source of sample-position data. |
 | **Interferometry** | Laser interferometers measuring stage position to nanometer precision. Multiple channels (`I7`, `I15`, …) are combined to compute X/Y/Z. |
 | **Trigger** | The pulse telling detectors to acquire one frame. **The trigger number is the master index** linking position to every detector datum. |
-| **ROI** | *Region of Interest* — a rectangular sub-window of an area-detector frame, `(y_start, y_end, x_start, x_end)`. |
-| **CoM** | *Center of Mass* — the intensity-weighted centroid within an ROI, reported per axis (`COM_X`, `COM_Y`). |
+| **ROI** | *Region of Interest* — a 1D, 2D, or 3D sub-window of an area-detector frame. `x_start`/`x_end` are always required; adding `y_start`/`y_end` makes it 2D, and adding `z_start`/`z_end` on top of that makes it 3D. |
+| **CoM** | *Center of Mass* — the intensity-weighted centroid within an ROI, reported per axis present in the ROI (`COM_X` for a 1D ROI, `COM_Y`/`COM_X` for 2D, `COM_Z`/`COM_Y`/`COM_X` for 3D). |
 | **Azimuthal integration** | Collapsing a 2D diffraction image into a 1D intensity-vs-angle curve. *(Planned — see [Roadmap](#roadmap--not-yet-implemented).)* |
 | **2θ (two-theta)** | Scattering angle in diffraction; the x-axis of an azimuthally-integrated pattern. |
 | **Master file** | The per-scan NeXus/bluesky file `Scan_XXXX.h5` at the data root, into which processed results are linked. |
@@ -208,8 +212,9 @@ Two data-integrity corrections live in the pipeline — keep them in mind:
 
 The goal is a **2D scalar map** `Z(X, Y)`:
 
-- **ROI mode** reduces each frame to three scalars — `Intensity`, `COM_Y`,
-  `COM_X` — chosen via `roi_type`.
+- **ROI mode** reduces each frame to `Intensity` plus one CoM scalar per axis
+  present in the ROI (`COM_X` for a 1D ROI, `COM_Y`/`COM_X` for 2D,
+  `COM_Z`/`COM_Y`/`COM_X` for 3D) — chosen via `roi_type`.
 - **Channel mode** (`ch=`) maps a scalar-detector value (e.g. Tetramm nA).
 - **Normalization** (`norm_detector`, `norm_ch`) divides the signal by a
   reference channel.
@@ -224,16 +229,21 @@ Maps are saved to the master file under
 
 ### 4. ROIs and reproducibility
 
-ROIs are created with the [`Roi`](mictools/roi_utils.py) class:
+ROIs are created with the [`Roi`](mictools/roi_utils.py) class. `x_start`/
+`x_end` are always required; adding `y_start`/`y_end` makes the ROI 2D, and
+adding `z_start`/`z_end` on top of that makes it 3D (dimensions can't be
+skipped — a 3D ROI must also specify y):
 
 ```python
 from mictools.roi_utils import Roi
-roi = Roi(y_start=100, y_end=200, x_start=150, x_end=250, name="roi1")
+roi_2d = Roi(y_start=100, y_end=200, x_start=150, x_end=250, name="roi1")
+roi_1d = Roi(x_start=150, x_end=250, name="roi_1d")
+roi_3d = Roi(z_start=0, z_end=5, y_start=100, y_end=200, x_start=150, x_end=250, name="roi_3d")
 ```
 
 When a map is produced from an ROI, the ROI geometry is saved as attributes on
-the processed file (`roi_name`, `roi_y_start/end`, `roi_x_start/end`) so the map
-records how it was made.
+the processed file (`roi_name`, and `roi_{axis}_start`/`roi_{axis}_end` for
+each axis present in the ROI) so the map records how it was made.
 
 #### ROI registry
 
@@ -270,9 +280,9 @@ plot_flyscan(scanno=43, detector="me7", roi="roi1")
 
 > [!NOTE]
 > The registry (`analysis/`) holds **human-curated** artifacts and is kept
-> separate from the machine-written `Raw/` and `Processed/` trees. `pyyaml` is
-> imported lazily, so importing the pipeline never requires it — but it is now a
-> declared dependency.
+> separate from the machine-written `Raw/` and `Processed/` trees. `pyyaml` and `pyFAI` are now declared
+> dependencies; `plotly`, `lmfit`, and `ipywidgets` are still missing from
+> `pyproject.toml` (see the [Installation warning](#installation)).
 
 ### 5. Derived arrays and provenance
 
@@ -286,11 +296,29 @@ for the diffraction detector:
 Each derived array is meant to carry a **link back to its parent dataset**, so
 any map is traceable to its origin.
 
+Azimuthal integration is implemented in
+[`powder_utils.py`](mictools/powder_utils.py):
+
+```python
+from mictools.powder_utils import process_azimuthal_integration
+
+result = process_azimuthal_integration(
+    scanno=42, detector="xrd",
+    poni_file="/path/to/detector.poni",
+    integration_name="xrd_2th",
+)
+# result: dict with 'radial' (2θ in degrees), 'I' (shape n_frames × npt), 'Timestamp'
+```
+
+Results are cached in `Processed/Scan_XXXX/{detector}.h5` under the named
+integration group and linked into the master file. Pass `replace=True` to
+reintegrate.
+
 > [!NOTE]
-> **Planned.** Today provenance is a single `parent_dataset` **string
-> attribute** on saved maps, and azimuthal integration
-> ([`powder_utils.py`](mictools/powder_utils.py)) is a stub. See
-> [Roadmap](#roadmap--not-yet-implemented).
+> Provenance today is a single `parent_dataset` **string attribute** on saved
+> maps — real HDF5 links from derived arrays to their parents are still planned.
+> The 2θ-window → scalar reduction step needed to map diffraction data is also
+> not yet implemented. See [Roadmap](#roadmap--not-yet-implemented).
 
 ---
 
@@ -322,9 +350,10 @@ mictools/
 │                       #   process_position_data, mesh_detector_data, ROI/Tetramm procs
 ├── plot_data.py       # plot_flyscan, plot_closest_frame, plot_sum_detector_image
 ├── peak_modelling.py  # STEP-scan lmfit fitting (fit_scan, graph_run, analyze_run)
-├── roi_utils.py       # Roi(y_start, y_end, x_start, x_end, name)
+├── roi_utils.py       # Roi(y_start, y_end, x_start, x_end, name, z_start, z_end) — 1D/2D/3D
 ├── data_proc.py       # ⚠️ DEPRECATED legacy implementation (different units/paths)
-├── powder_utils.py    # (stub) azimuthal integration — not yet implemented
+├── powder_utils.py    # Azimuthal integration: sum_detector_images, stack_detector_image,
+│                       #   process_azimuthal_integration (pyFAI, per-frame, parallel, cached)
 └── __init__.py        # (empty) — import from submodules, e.g. mictools.plot_data
 ```
 
@@ -334,7 +363,7 @@ mictools/
 | `load_data.py`, `plot_data.py`, `config.py`, `roi_utils.py` | ✅ Core | Loading, plotting, configuration. |
 | `peak_modelling.py` | ✅ Core | Step-scan peak fitting. |
 | `data_proc.py` | 🚫 Deprecated | Older parallel implementation with different path/unit conventions (`analysis/`, counts→nm). **Do not use for new work.** |
-| `powder_utils.py` | 🔜 Stub | Azimuthal integration placeholder. |
+| `powder_utils.py` | ✅ Core | Azimuthal integration: frame summing/stacking + per-frame 1D `I(2θ)` via pyFAI. |
 
 ---
 
@@ -405,7 +434,9 @@ planned throughout this document:
 - [ ] **Interferometry-clock (`Counter2`) position mode** — optional finer
       position reconstruction using per-reading data instead of per-trigger
       averaging.
-- [ ] **Azimuthal integration** (`powder_utils.py`) — image → 1D `I(2θ)`.
+- [x] **Azimuthal integration** (`powder_utils.py`) — per-frame 1D `I(2θ)` via
+      pyFAI; `.poni` calibration, optional mask, error models, polarization
+      correction, parallel processing, cached in `Processed/`.
 - [ ] **2θ-window integration** — reduce `I(2θ)` to a scalar for mapping.
 - [ ] **Real provenance links** — HDF5 links from derived arrays to parents
       (currently a `parent_dataset` string attribute only).
