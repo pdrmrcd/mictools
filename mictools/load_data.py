@@ -55,9 +55,42 @@ def load_scan(scanno, path=None, stream="primary", cat=None):
     return scan
 
 
-def file_names(scanno, detector, path=None):
+def raw_data_dir(scanno, detector, path=None):
+    '''
+    Directory holding one detector's raw files for one scan.
+
+    Single definition of where raw data lives: :func:`file_names` globs inside
+    it, and provenance attributes reference it (see :func:`data_reference`).
+    '''
     path = get_path(path)
-    file_path = path + f'/Raw/Scan_{scanno:04d}/' + detector.upper() + f"/scan_{scanno:04d}_*.h5"
+    return path + f'/Raw/Scan_{scanno:04d}/' + detector.upper()
+
+
+def data_reference(target, group_path=None, path=None):
+    '''
+    Build a provenance reference to a file, directory, or object inside an
+    HDF5 file, of the form ``'{target}'`` or ``'{target}::{group_path}'``.
+
+    ``target`` is expressed relative to the data root so that references
+    survive the experiment directory being moved or copied; a target outside
+    the data root keeps its absolute path. See the provenance conventions in
+    the README for what each processing step records.
+
+    Parameters:
+    - target: Path to a file or directory (str), typically a raw detector
+        directory (:func:`raw_data_dir`) or a processed HDF5 file.
+    - group_path: Path to a group or dataset inside ``target``, when the
+        parent is one specific object rather than a whole directory (str).
+    - path: Path to data files (str)
+    '''
+    relative = os.path.relpath(target, get_path(path))
+    if relative.startswith(os.pardir):
+        relative = target
+    return f'{relative}::{group_path}' if group_path else relative
+
+
+def file_names(scanno, detector, path=None):
+    file_path = raw_data_dir(scanno, detector, path) + f"/scan_{scanno:04d}_*.h5"
     files = glob(file_path)
     files.sort()
     return files

@@ -7,6 +7,8 @@ from functools import partial
 import os
 
 from .load_data import file_names
+from .load_data import raw_data_dir
+from .load_data import data_reference
 from .load_data import load_interferometry_data
 from .load_data import get_scan_info
 from .load_data import load_scan
@@ -16,7 +18,53 @@ from .roi_utils import RoiRegistry
 from .roi_utils import _resolve_roi
 
 
-def process_roi_file(file, roi):
+def _reduce_roi_intensity_com(data, roi):
+    '''
+    Reduce an array of shape (n_frames, <roi.ndim spatial dims>) to a total
+    intensity and one center-of-mass value per roi axis, using the same
+    vectorized math as process_roi_file.
+
+    Parameters:
+    - data: Array with a leading frame axis followed by exactly roi.ndim
+        spatial axes, already sliced to the roi's bounds.
+    - roi: Region of interest (roi_utils.Roi) whose axis_names()/axis_ranges()
+        describe data's spatial axes.
+
+    Returns:
+    - Dictionary containing 'intensity' and one 'com_{axis}' entry per axis
+      present in the roi (e.g. just 'com_x' for a 1D roi)
+    '''
+    axis_names = roi.axis_names()
+    axis_ranges = roi.axis_ranges()
+    grids = np.meshgrid(*[np.arange(s, e) for s, e in axis_ranges], indexing='ij')
+    sum_axes = tuple(range(1, roi.ndim + 1))
+
+    # Calculate total intensity for each frame
+    total_intensity = np.sum(data, axis=sum_axes)
+
+    # Store original intensity
+    intensity = total_intensity.copy()
+
+    # Avoid division by zero
+    total_intensity = np.where(total_intensity == 0, 1, total_intensity)
+
+    # Calculate COM using vectorized operations, one per roi axis
+    com = {
+        f'com_{n}': np.sum(data * g[np.newaxis, ...], axis=sum_axes) / total_intensity
+        for n, g in zip(axis_names, grids)
+    }
+
+    return {'intensity': intensity, **com}
+
+
+# XRF area detectors, whose raw frames are (n_frames, y, x) with y indexing
+# detector elements rather than a spatial axis. A 1D (x-only) roi on these is
+# read as an energy window on the element-summed spectrum - see the bin_y
+# argument of process_roi_file.
+XRF_DETECTORS = {'me7', 'rayspec'}
+
+
+def process_roi_file(file, roi, bin_y=False):
     '''
     Process a single HDF5 file and extract ROI data.
 
@@ -24,44 +72,51 @@ def process_roi_file(file, roi):
     - file: Path to HDF5 file (str)
     - roi: Region of interest (roi_utils.Roi), 1D, 2D, or 3D. The dataset's
         spatial dimensionality (its shape excluding the leading frame axis)
-        must match roi.ndim.
+        must match roi.ndim, unless bin_y is set.
+    - bin_y: When True, each (y, x) frame is first summed along y into a 1D
+        spectrum, and the (1D) roi is applied to that spectrum. Used for a 1D
+        roi on the XRF detectors, whose y axis indexes detector elements
+        rather than a spatial dimension. The summation spans the whole y
+        extent of the file, whatever it is, so detectors with different
+        element counts are handled alike. No intermediate spectrum is kept:
+        only the roi's x window is read, and it is reduced to scalars here.
 
     Returns:
     - Dictionary containing intensity, one 'com_{axis}' entry per axis present
       in the roi (e.g. just 'com_x' for a 1D roi), and timestamps
     '''
-    axis_names = roi.axis_names()
     axis_ranges = roi.axis_ranges()
-    grids = np.meshgrid(*[np.arange(s, e) for s, e in axis_ranges], indexing='ij')
     roi_slice = (slice(None),) + tuple(slice(s, e) for s, e in axis_ranges)
-    sum_axes = tuple(range(1, roi.ndim + 1))
 
     with File(file, "r") as f:
         dset = f["entry/data/data"]
-        if dset.ndim - 1 != roi.ndim:
+        if bin_y:
+            if dset.ndim - 1 != 2:
+                raise ValueError(
+                    f"Y-binning requires 2 spatial dimensions per frame, but "
+                    f"dataset 'entry/data/data' in {file!r} has shape "
+                    f"{dset.shape} ({dset.ndim - 1} spatial dimension(s) per "
+                    f"frame)."
+                )
+            # Read only the roi's x window, across every y element, and
+            # collapse y. int64 keeps the COM math below in integer
+            # arithmetic - a uint32 sum comes back as uint64, which numpy
+            # would promote to float64 against the int64 coordinate grid.
+            data_roi = np.sum(dset[:, :, roi.x_start:roi.x_end], axis=1,
+                              dtype=np.int64)
+        elif dset.ndim - 1 != roi.ndim:
             raise ValueError(
                 f"ROI dimensionality mismatch: dataset 'entry/data/data' in "
                 f"{file!r} has shape {dset.shape} ({dset.ndim - 1} spatial "
                 f"dimension(s) per frame), but roi {roi.name!r} is {roi.ndim}D "
-                f"({', '.join(axis_names)}). Use an ROI with a matching number "
-                f"of dimensions."
+                f"({', '.join(roi.axis_names())}). Use an ROI with a matching "
+                f"number of dimensions."
             )
-        data_roi = dset[roi_slice]
-
-        # Calculate total intensity for each frame
-        total_intensity = np.sum(data_roi, axis=sum_axes)
-
-        # Store original intensity
-        intensity = total_intensity.copy()
-
-        # Avoid division by zero
-        total_intensity = np.where(total_intensity == 0, 1, total_intensity)
-
-        # Calculate COM using vectorized operations, one per roi axis
-        com = {
-            f'com_{n}': np.sum(data_roi * g[np.newaxis, ...], axis=sum_axes) / total_intensity
-            for n, g in zip(axis_names, grids)
-        }
+        else:
+            data_roi = dset[roi_slice]
+        reduced = _reduce_roi_intensity_com(data_roi, roi)
+        intensity = reduced['intensity']
+        com = {k: v for k, v in reduced.items() if k != 'intensity'}
 
         tset = f["entry/instrument/NDAttributes/NDArrayTimeStamp"]
         times = tset[:]
@@ -117,6 +172,13 @@ def process_roi_data(scanno,
     present in the roi (e.g. just 'COM_X' for a 1D roi, 'COM_Y'/'COM_X' for a
     2D roi, 'COM_Z'/'COM_Y'/'COM_X' for a 3D roi).
 
+    The roi's dimensionality must match the detector data's, with one
+    exception: on the XRF detectors ('me7', 'rayspec') a 1D roi is taken as an
+    energy window on the element-summed spectrum, so each frame is binned
+    along y before the roi is applied. The binning happens per file inside the
+    workers and only the resulting scalars are kept, so nothing beyond the
+    usual roi group is written.
+
     Parameters:
     - scanno: Scan number (int)
     - detector: Detector name (str). Must be an area detector such as
@@ -161,8 +223,12 @@ def process_roi_data(scanno,
         raise ValueError("roi must be an instance of roi class from roi_utils.py" \
         "defined from roi_utils.py as roiN = roi(y_start, y_end, x_start, x_end, name=\"roiN\")")
 
+    # A 1D roi on an XRF detector is an energy window on the element-summed
+    # spectrum, so each frame is binned along y before the roi is applied.
+    bin_y = detector.lower() in XRF_DETECTORS and roi.ndim == 1
+
     # Create partial function with fixed roi parameter
-    process_func = partial(process_roi_file, roi=roi)
+    process_func = partial(process_roi_file, roi=roi, bin_y=bin_y)
 
     # Process files in parallel
     with Pool(processes=n_workers) as pool:
@@ -178,12 +244,6 @@ def process_roi_data(scanno,
         data[col] = np.concatenate([r[f'com_{n}'] for r in results], axis=0)
 
     df = pd.DataFrame(data)
-
-    # # Temporary correction for ghost frame implemented by the xpress3 for ME7 and RAYSPEC. This should be removed once the issue is fixed at the source.
-    # if detector.upper() == 'ME7' or detector.upper() == 'RAYSPEC':
-    #     with File(files[0], "r") as f:
-    #         if f['entry/instrument/NDAttributes/NDArrayUniqueId'][0] == -1:
-    #             df = df.iloc[1:].reset_index(drop=True)
 
     # Ensure processed directory exists
     save_dir = os.path.dirname(processed_path)
@@ -207,6 +267,12 @@ def process_roi_data(scanno,
         for axis_name, (start, end) in zip(roi.axis_names(), roi.axis_ranges()):
             nxdata.attrs[f'roi_{axis_name}_start'] = start
             nxdata.attrs[f'roi_{axis_name}_end']   = end
+        if bin_y:
+            nxdata.attrs['y_binned'] = True
+
+        # Provenance: every raw file of this detector was reduced to get here.
+        nxdata.attrs['parent_dataset'] = data_reference(raw_data_dir(scanno, detector, path))
+        nxdata.attrs['operation']      = 'roi_reduction'
 
         nxdata.create_dataset('Timestamp', data=df['Timestamp'].values)
         ds = nxdata.create_dataset('Intensity', data=df['Intensity'].values)
@@ -305,6 +371,8 @@ def process_tetramm_data(scanno,
         save_dir = os.path.dirname(processed_path)
         os.makedirs(save_dir, exist_ok=True)
 
+        raw_reference = data_reference(raw_data_dir(scanno, detector, path))
+
         with File(processed_path, 'a') as f:
             entry = f.require_group('entry')
             entry.attrs['NX_class'] = 'NXentry'
@@ -317,6 +385,10 @@ def process_tetramm_data(scanno,
                 nxdata = f.create_group(group_path)
                 nxdata.attrs['NX_class'] = 'NXdata'
                 nxdata.attrs['signal']   = f'Current {c}'
+
+                # Provenance: the raw files this channel was extracted from.
+                nxdata.attrs['parent_dataset'] = raw_reference
+                nxdata.attrs['operation']      = 'channel_extraction'
 
                 ds = nxdata.create_dataset(f'Current {c}', data=processed[c][f'Current {c}'].values)
                 ds.attrs['units']     = 'nA'
@@ -352,6 +424,9 @@ def process_detector_data(scanno,
     - ROI detectors ('me7', 'xrd', 'ptycho', 'rayspec') are routed to
       process_roi_data (a DataFrame with Timestamp, Intensity, and one
       COM_{AXIS} column per axis present in the roi - see process_roi_data).
+      For 'me7'/'rayspec' specifically, a 1D (x-only) roi is also accepted:
+      each frame is binned (summed) along y into a spectrum on the fly, and
+      the roi is applied to that spectrum as an energy window.
     - Tetramm-family detectors ('tetramm', 'tetramm1', 'tetramm2', ...) are
       routed to process_tetramm_data (a DataFrame with one 'Current {ch}'
       column per requested channel).
@@ -466,6 +541,11 @@ def process_position_data(scanno,
         nxdata.attrs['axes']      = 'X_Position'
         nxdata.attrs['x_indices'] = [0]
 
+        # Provenance: positions are reconstructed from the interferometry
+        # readings in the SOCKETSERVER raw files (see load_interferometry_data).
+        nxdata.attrs['parent_dataset'] = data_reference(raw_data_dir(scanno, 'socketserver', path))
+        nxdata.attrs['operation']      = 'position_reconstruction'
+
         nxdata.create_dataset('Trigger', data=df['Trigger'].values)
 
         ds = nxdata.create_dataset('X_Position', data=df['X_Position'].values)
@@ -508,16 +588,28 @@ def mesh_detector_data(scanno,
     # scan can be recorded against the ROI (push-tracked reproducibility).
     roi = _resolve_roi(roi, path, register=True, override=roi_override)
 
-    # Define image group path and processed data path based on roi or channel
+    # Define image group path and processed data path based on roi or channel.
+    # parent_dataset is the detector column the map displays; every other input
+    # that shaped it is auxiliary (see data_reference).
     if roi is not None:
         RoiRegistry.load(path).record_usage(roi.name, scanno)
         images_path = f'entry/data/{detector.upper()}/Images/{roi.name}_{roi_type}'
         processed_path = path + f'/Processed/Scan_{scanno:04d}/{detector.lower()}.h5'
-        parent_dataset = f'{processed_path}::entry/data/{roi.name}/{roi_type}'
+        parent_dataset = data_reference(processed_path, f'entry/data/{roi.name}/{roi_type}', path)
     elif ch is not None:
         images_path = f'entry/data/{detector.upper()}/Images/channel_{ch}'
         processed_path = path + f'/Processed/Scan_{scanno:04d}/{detector.lower()}.h5'
-        parent_dataset = f'{processed_path}::entry/data/channel_{ch}'
+        parent_dataset = data_reference(processed_path, f'entry/data/channel_{ch}/Current {ch}', path)
+    else:
+        raise ValueError(
+            "mesh_detector_data requires either a 'roi' (for an area detector) "
+            "or a 'ch' (for a tetramm-family detector); both were None."
+        )
+
+    # The positions the detector values are interpolated onto place the map on
+    # the sample, but are not what it measures - so they are auxiliary.
+    auxiliary_datasets = [data_reference(path + f'/Processed/Scan_{scanno:04d}/position.h5',
+                                         'entry/data', path)]
 
     if th is None:
         baseline_data = load_scan(scanno, stream='baseline', path=path)
@@ -535,6 +627,11 @@ def mesh_detector_data(scanno,
         norm_data = process_detector_data(scanno, norm_detector, ch=norm_ch, path=path, replace=replace)
         for col in detector_data.columns:
             detector_data[col] = detector_data[col]/norm_data[f'Current {norm_ch}']
+        # Normalization scales the mapped values without being their source.
+        norm_processed_path = path + f'/Processed/Scan_{scanno:04d}/{norm_detector.lower()}.h5'
+        auxiliary_datasets.append(
+            data_reference(norm_processed_path,
+                           f'entry/data/channel_{norm_ch}/Current {norm_ch}', path))
 
     # Align lengths
     frame_mismatch = len(detector_data) - len(position_data)
@@ -595,7 +692,9 @@ def mesh_detector_data(scanno,
         nximages.attrs['NX_class']       = 'NXdata'
         nximages.attrs['signal']         = 'Z'
         nximages.attrs['axes']           = ['Y', 'X']
-        nximages.attrs['parent_dataset'] = parent_dataset
+        nximages.attrs['parent_dataset']      = parent_dataset
+        nximages.attrs['auxiliary_datasets']  = auxiliary_datasets
+        nximages.attrs['operation']           = 'mesh_interpolation'
         if roi is not None:
             nximages.attrs['roi_type'] = roi_type
         nximages.create_dataset('X', data=x_axis)

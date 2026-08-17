@@ -6,7 +6,7 @@ from multiprocessing import Pool, cpu_count
 import fabio
 import pyFAI
 
-from .load_data import file_names
+from .load_data import file_names, raw_data_dir, data_reference
 from .config import get_analysis_path, get_path
 from .roi_utils import _validate_name
 
@@ -335,6 +335,12 @@ def process_azimuthal_integration(scanno,
         nxdata.attrs['error_model']         = error_model if error_model else 'none'
         if polarization_factor is not None:
             nxdata.attrs['polarization_factor'] = polarization_factor
+
+        # Provenance: every raw frame of this detector was integrated to get
+        # here. The attributes above record the parameters of the step; this
+        # records its input.
+        nxdata.attrs['parent_dataset'] = data_reference(raw_data_dir(scanno, detector, path))
+        nxdata.attrs['operation']      = 'azimuthal_integration'
 
         # Geometry snapshot for provenance/reproducibility.
         calibration = pyFAI.load(poni_path)

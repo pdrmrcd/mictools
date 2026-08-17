@@ -79,8 +79,8 @@ def plot_meshed_data(X, Y, Z, ax = None, fig = None, **kwargs):
     fig.colorbar(pcm, ax=ax)
 
     ax.set_aspect('equal')
-    ax.set_xlabel('X (µm)')
-    ax.set_ylabel('Y (µm)')
+    ax.set_xlabel('X (mm)')
+    ax.set_ylabel('Y (mm)')
 
     plt.show()
 

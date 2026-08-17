@@ -127,6 +127,7 @@ Unless stated otherwise, the rest of this document concerns **flyscans**.
 | **Trigger** | The pulse telling detectors to acquire one frame. **The trigger number is the master index** linking position to every detector datum. |
 | **ROI** | *Region of Interest* — a 1D, 2D, or 3D sub-window of an area-detector frame. `x_start`/`x_end` are always required; adding `y_start`/`y_end` makes it 2D, and adding `z_start`/`z_end` on top of that makes it 3D. |
 | **CoM** | *Center of Mass* — the intensity-weighted centroid within an ROI, reported per axis present in the ROI (`COM_X` for a 1D ROI, `COM_Y`/`COM_X` for 2D, `COM_Z`/`COM_Y`/`COM_X` for 3D). |
+| **Spectrum** | For the XRF area detectors (`me7`, `rayspec`), a frame summed over its `y` (detector-element) axis into a 1D intensity-vs-energy-channel curve. Computed on the fly when a 1D ROI is used, never stored — see [1D ROIs on the XRF detectors](#1d-rois-on-the-xrf-detectors-me7--rayspec). |
 | **Azimuthal integration** | Collapsing a 2D diffraction image into a 1D intensity-vs-angle curve. *(Planned — see [Roadmap](#roadmap--not-yet-implemented).)* |
 | **2θ (two-theta)** | Scattering angle in diffraction; the x-axis of an azimuthally-integrated pattern. |
 | **Master file** | The per-scan NeXus/bluesky file `Scan_XXXX.h5` at the data root, into which processed results are linked. |
@@ -195,6 +196,10 @@ Each trigger produces frames from several detectors under one scan number:
 
 - **Area detectors** (e.g. `me7`/xpress3, `xrd`, `ptycho`, `rayspec`): 3D
   stacks `(n_frames, y, x)` stored at `entry/data/data`.
+- **XRF area detectors** (`me7`, `rayspec`) are a special case of the above:
+  their `y` axis indexes detector elements and `x` indexes energy channels, so
+  a 1D (x-only) ROI is also accepted — see
+  [1D ROIs on the XRF detectors](#1d-rois-on-the-xrf-detectors-me7--rayspec).
 - **Scalar detectors** (e.g. `tetramm` ion-chamber currents): per-channel
   values.
 
@@ -207,6 +212,40 @@ Two data-integrity corrections live in the pipeline — keep them in mind:
   `mesh_detector_data` computes `frame_mismatch = len(detector) − len(position)`
   and trims one end, controlled by `missed_frame_position`
   (`"Beginning"` trims the tail, otherwise the head).
+
+#### 1D ROIs on the XRF detectors (`me7` / `rayspec`)
+
+For the two XRF area detectors the `y` axis of `(n_frames, y, x)` is a stack of
+detector elements, not a spatial dimension, so the usual "ROI dimensionality
+must match the dataset" rule is relaxed: a **1D (x-only) ROI** is read as an
+**energy window on the element-summed spectrum**. Each frame is summed over `y`
+and the ROI is applied to the result. Binning spans whatever `y` extent the
+detector's own raw data has (`me7` and `rayspec` differ), so nothing is
+hardcoded.
+
+```python
+from mictools.process_data import process_detector_data
+from mictools.roi_utils import Roi
+
+# 1D ROI = an energy window on the y-summed spectrum
+df = process_detector_data(42, "me7", roi=Roi(x_start=150, x_end=250, name="fe_ka"))
+# -> DataFrame with Timestamp / Intensity / COM_X
+```
+
+The y-summed spectrum is an **intermediate only** — it is never written to
+disk. Each worker reads just its own file's x-window, collapses `y`, and
+reduces straight to scalars, so peak memory stays at one raw file per worker
+and `Processed/` gains nothing beyond the usual scalar ROI group (saved and
+linked exactly like any other ROI, with an extra `y_binned` attribute
+recording how it was computed). Materializing the whole spectrum instead would
+cost ~16 GB for a full ME7 scan to produce three scalar columns.
+
+The trade: a second, differently-named 1D ROI re-reads the raw files. Re-running
+the *same* ROI still returns from the cache without touching raw data, as usual.
+
+Passing a 2D (or 3D) ROI to `me7`/`rayspec` is unchanged — frames are reduced
+directly. For the non-XRF area detectors (`xrd`, `ptycho`) a dimensionality
+mismatch is still an error.
 
 ### 3. Producing a map
 
@@ -240,6 +279,11 @@ roi_2d = Roi(y_start=100, y_end=200, x_start=150, x_end=250, name="roi1")
 roi_1d = Roi(x_start=150, x_end=250, name="roi_1d")
 roi_3d = Roi(z_start=0, z_end=5, y_start=100, y_end=200, x_start=150, x_end=250, name="roi_3d")
 ```
+
+The ROI's dimensionality must match the detector data's spatial dimensionality,
+with one exception: a 1D ROI on `me7`/`rayspec` triggers
+[y-binning](#1d-rois-on-the-xrf-detectors-me7--rayspec) before the ROI is
+applied.
 
 When a map is produced from an ROI, the ROI geometry is saved as attributes on
 the processed file (`roi_name`, and `roi_{axis}_start`/`roi_{axis}_end` for
@@ -293,8 +337,19 @@ for the diffraction detector:
 2D image ──azimuthal integration──► 1D I(2θ) ──integrate 2θ window──► scalar ──► map
 ```
 
-Each derived array is meant to carry a **link back to its parent dataset**, so
-any map is traceable to its origin.
+The same shape applies to the XRF detectors and is already implemented
+([1D ROIs on the XRF detectors](#1d-rois-on-the-xrf-detectors-me7--rayspec)),
+except that the intermediate is never materialized — the two steps are fused
+inside each worker, so only the final scalar is stored:
+
+```
+(y, x) frame ──sum over y──► 1D spectrum ──1D ROI (energy window)──► scalar ──► map
+                             (in memory, per file)
+```
+
+Every derived array carries a **pointer back to what it was computed from**, so
+any map is traceable to its origin — see
+[Provenance](#provenance-tracking-a-dataset-back-to-its-origin).
 
 Azimuthal integration is implemented in
 [`powder_utils.py`](mictools/powder_utils.py):
@@ -314,11 +369,68 @@ Results are cached in `Processed/Scan_XXXX/{detector}.h5` under the named
 integration group and linked into the master file. Pass `replace=True` to
 reintegrate.
 
+#### Provenance: tracking a dataset back to its origin
+
+Every group a processing step writes carries attributes recording what it came
+from, so any result can be traced back through each step that produced it:
+
+| Attribute | Type | Meaning |
+|---|---|---|
+| `parent_dataset` | string — **exactly one** | The main dataset this group was computed from |
+| `auxiliary_datasets` | array of strings; **omitted when there are none** | Other inputs that shaped the result without being its source — normalization and position data |
+| `operation` | string | What was done at this step |
+
+The split matters when walking a chain: `parent_dataset` is a single reference,
+so following it gives one unambiguous line back to the raw data, and the
+auxiliary inputs branch off it. A meshed map, for instance, *is* its detector
+column — the positions place that column on the sample and a normalization
+channel scales it, but neither is what the map measures.
+
+References come in two forms. A **raw detector directory** (`Raw/Scan_0949/ME7`)
+is used when a step consumes every file in it; the internal layout of those
+files is fixed by convention (see *Key raw-file HDF5 paths* below), so the
+directory identifies the origin without listing hundreds of paths. A
+**specific object**, `{file}::{hdf5 path}`
+(`Processed/Scan_0949/me7.h5::entry/data/roi1/Intensity`), is used when the
+parent really is one dataset or group — note that provenance itself lives on
+the enclosing **group**, so a reference naming a dataset means "read the
+attributes of its parent group".
+
+Paths are **relative to the data root**, so the whole experiment tree can be
+moved or copied without breaking the chain. A parent outside the data root
+keeps its absolute path.
+
+| Step | Group it writes | `parent_dataset` | `auxiliary_datasets` | `operation` |
+|---|---|---|---|---|
+| `process_roi_data` | `Processed/…/{detector}.h5::entry/data/{roi.name}` | `Raw/Scan_XXXX/{DETECTOR}` | — | `roi_reduction` |
+| `process_tetramm_data` | `…::entry/data/channel_{ch}` | `Raw/Scan_XXXX/{DETECTOR}` | — | `channel_extraction` |
+| `process_position_data` | `Processed/…/position.h5::entry/data` | `Raw/Scan_XXXX/SOCKETSERVER` | — | `position_reconstruction` |
+| `process_azimuthal_integration` | `…::entry/data/{integration_name}` | `Raw/Scan_XXXX/{DETECTOR}` | — | `azimuthal_integration` |
+| `mesh_detector_data` | `Scan_XXXX.h5::entry/data/{DETECTOR}/Images/{name}` | the detector column | the positions, plus the normalization channel if used | `mesh_interpolation` |
+
+A meshed map therefore unfolds into the full history of how it was made — the
+main line on the left, auxiliary inputs branching off it:
+
+```
+Images/roi1_Intensity                                                  (mesh_interpolation)
+│
+├─ parent     Processed/Scan_0949/me7.h5::entry/data/roi1/Intensity    (roi_reduction)
+│             └─ parent  Raw/Scan_0949/ME7
+│
+└─ auxiliary  Processed/Scan_0949/position.h5::entry/data              (position_reconstruction)
+              └─ parent  Raw/Scan_0949/SOCKETSERVER
+```
+
+Build a reference yourself with `load_data.data_reference(target, group_path)`;
+`load_data.raw_data_dir(scanno, detector)` gives the raw directory a step
+consumed.
+
 > [!NOTE]
-> Provenance today is a single `parent_dataset` **string attribute** on saved
-> maps — real HDF5 links from derived arrays to their parents are still planned.
-> The 2θ-window → scalar reduction step needed to map diffraction data is also
-> not yet implemented. See [Roadmap](#roadmap--not-yet-implemented).
+> Provenance is carried by **string attributes**, not real HDF5 links — those
+> are still planned, and only string references can express a whole-directory
+> parent anyway. The 2θ-window → scalar reduction step needed to map
+> diffraction data is also not yet implemented. See
+> [Roadmap](#roadmap--not-yet-implemented).
 
 ---
 
@@ -401,7 +513,12 @@ source file + internal group changed, per above):
 
 Key raw-file HDF5 paths: frames `entry/data/data`; timestamps
 `entry/instrument/NDAttributes/NDArrayTimeStamp`; ghost-frame flag
-`entry/instrument/NDAttributes/NDArrayUniqueId`.
+`entry/instrument/NDAttributes/NDArrayUniqueId`. These are fixed by convention,
+which is why a provenance reference can name a whole raw directory.
+
+Every group listed above also carries `parent_dataset`, `operation`, and (where
+applicable) `auxiliary_datasets` attributes pointing at what it was computed
+from — see [Provenance](#provenance-tracking-a-dataset-back-to-its-origin).
 
 ---
 
@@ -438,7 +555,13 @@ planned throughout this document:
       pyFAI; `.poni` calibration, optional mask, error models, polarization
       correction, parallel processing, cached in `Processed/`.
 - [ ] **2θ-window integration** — reduce `I(2θ)` to a scalar for mapping.
-- [ ] **Real provenance links** — HDF5 links from derived arrays to parents
-      (currently a `parent_dataset` string attribute only).
+- [x] **Provenance chain** — every processed group records a single
+      `parent_dataset` (root-relative), any `auxiliary_datasets`, and the
+      `operation` performed, so a map can be walked back through each step to
+      the raw files. See
+      [Provenance](#provenance-tracking-a-dataset-back-to-its-origin).
+- [ ] **Real provenance links** — HDF5 links, rather than string references,
+      from derived arrays to parents. Only applicable where the parent is a
+      single resolvable object; a whole-raw-directory parent stays a string.
 - [ ] **Declare missing dependencies** in `pyproject.toml`
       (`plotly`, `lmfit`, `ipywidgets`). `pyyaml` is now declared.
