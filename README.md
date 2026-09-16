@@ -3,7 +3,7 @@
 **Support tools for the APS Microscopy Group** — loading, processing, and
 visualizing scan data from the **In-Situ Nanoprobe (ISN, beamline 19-ID)**.
 
-`mictools` turns the asynchronously-triggered data of an FPGA-controlled
+`mictools` turns the time-based-triggered data of an FPGA-controlled
 *flyscan* into aligned, trigger-indexed arrays and 2D maps, and provides
 lightweight helpers for analyzing conventional *step scans*.
 
@@ -99,6 +99,10 @@ from mictools.plot_data import plot_closest_frame
 plot_closest_frame(scanno=42, detector="me7", x=12.5, y=8.0, log_scale=True)
 ```
 
+On the XRF detectors (`me7`, `rayspec`) that call plots the frame's **1D
+spectrum** — summed over the detector elements — rather than a 2D image, by binning along the elements on each detector. See
+[1D ROIs on the XRF detectors](#1d-rois-on-the-xrf-detectors-me7--rayspec).
+
 > [!TIP]
 > `plot_flyscan` caches processed results to `Processed/` and links them into
 > the master file. Re-running is cheap; pass `replace=True` to force
@@ -138,7 +142,7 @@ A flyscan is timed by three clocks recorded by the SOCKETSERVER:
 
 | # | Clock | SOCKETSERVER column | Ticks when… | Purpose |
 |---|---|---|---|---|
-| 1 | **Master (1 MHz)** | `Counter1` | Always | Timestamps every row of data. |
+| 1 | **Master (1 MHz)** | `Counter1` | 1M times per second | Timestamps every row of data. |
 | 2 | **Interferometry clock** | `Counter2` | An interferometry reading is produced | Marks each position measurement. |
 | 3 | **Trigger clock** | `Counter3` | A detector trigger fires | Marks each detector frame; the map index. |
 
@@ -160,8 +164,8 @@ pipeline reconstructs positions, reduces detector frames to scalars, aligns the
 two, and interpolates onto a 2D grid.
 
 ```
-Raw SOCKETSERVER files ─► process_position_data ─┐
-   (group by trigger, average, → µm, set origin)  │
+Raw SOCKETSERVER files ─► process_position_data   ─┐
+   (group by trigger, average, → µm, set origin)   │
                                                    ▼
 Raw detector files ─► process_detector_data ─► mesh_detector_data ─► plot_flyscan
    (ghost-frame drop,      (ROI: I / COM_X / COM_Y   (align lengths,
@@ -246,6 +250,20 @@ the *same* ROI still returns from the cache without touching raw data, as usual.
 Passing a 2D (or 3D) ROI to `me7`/`rayspec` is unchanged — frames are reduced
 directly. For the non-XRF area detectors (`xrd`, `ptycho`) a dimensionality
 mismatch is still an error.
+
+To choose the window, `plot_closest_frame` applies the same y-binning and plots
+a single frame's spectrum, so you can read the peak channels straight off it:
+
+```python
+from mictools.plot_data import plot_closest_frame
+
+# Intensity vs energy channel for the frame nearest (12.5, 8.0) µm
+plot_closest_frame(42, "me7", x=12.5, y=8.0, log_scale=True)
+```
+
+`log_scale` puts the y axis on a log scale here (it is a `LogNorm` color scale
+for the image plot other detectors get), and extra keyword arguments go to
+`plt.plot` rather than `plt.imshow`.
 
 ### 3. Producing a map
 
@@ -404,8 +422,8 @@ keeps its absolute path.
 |---|---|---|---|---|
 | `process_roi_data` | `Processed/…/{detector}.h5::entry/data/{roi.name}` | `Raw/Scan_XXXX/{DETECTOR}` | — | `roi_reduction` |
 | `process_tetramm_data` | `…::entry/data/channel_{ch}` | `Raw/Scan_XXXX/{DETECTOR}` | — | `channel_extraction` |
-| `process_position_data` | `Processed/…/position.h5::entry/data` | `Raw/Scan_XXXX/SOCKETSERVER` | — | `position_reconstruction` |
 | `process_azimuthal_integration` | `…::entry/data/{integration_name}` | `Raw/Scan_XXXX/{DETECTOR}` | — | `azimuthal_integration` |
+| `process_position_data` | `Processed/…/position.h5::entry/data` | `Raw/Scan_XXXX/SOCKETSERVER` | — | `position_reconstruction` |
 | `mesh_detector_data` | `Scan_XXXX.h5::entry/data/{DETECTOR}/Images/{name}` | the detector column | the positions, plus the normalization channel if used | `mesh_interpolation` |
 
 A meshed map therefore unfolds into the full history of how it was made — the
@@ -463,7 +481,6 @@ mictools/
 ├── plot_data.py       # plot_flyscan, plot_closest_frame, plot_sum_detector_image
 ├── peak_modelling.py  # STEP-scan lmfit fitting (fit_scan, graph_run, analyze_run)
 ├── roi_utils.py       # Roi(y_start, y_end, x_start, x_end, name, z_start, z_end) — 1D/2D/3D
-├── data_proc.py       # ⚠️ DEPRECATED legacy implementation (different units/paths)
 ├── powder_utils.py    # Azimuthal integration: sum_detector_images, stack_detector_image,
 │                       #   process_azimuthal_integration (pyFAI, per-frame, parallel, cached)
 └── __init__.py        # (empty) — import from submodules, e.g. mictools.plot_data
@@ -474,7 +491,6 @@ mictools/
 | `process_data.py` | ✅ Core | The most important file; start here. |
 | `load_data.py`, `plot_data.py`, `config.py`, `roi_utils.py` | ✅ Core | Loading, plotting, configuration. |
 | `peak_modelling.py` | ✅ Core | Step-scan peak fitting. |
-| `data_proc.py` | 🚫 Deprecated | Older parallel implementation with different path/unit conventions (`analysis/`, counts→nm). **Do not use for new work.** |
 | `powder_utils.py` | ✅ Core | Azimuthal integration: frame summing/stacking + per-frame 1D `I(2θ)` via pyFAI. |
 
 ---
@@ -554,7 +570,7 @@ planned throughout this document:
 - [x] **Azimuthal integration** (`powder_utils.py`) — per-frame 1D `I(2θ)` via
       pyFAI; `.poni` calibration, optional mask, error models, polarization
       correction, parallel processing, cached in `Processed/`.
-- [ ] **2θ-window integration** — reduce `I(2θ)` to a scalar for mapping.
+- [ ] **2θ-window integration** — reduce `I(2θ)` to a scalar for mapping. This could be done in the `peak_modelling.py` module, along with fitting procedures.
 - [x] **Provenance chain** — every processed group records a single
       `parent_dataset` (root-relative), any `auxiliary_datasets`, and the
       `operation` performed, so a map can be walked back through each step to

@@ -8,18 +8,63 @@ from .load_data import *
 from .process_data import *
 from .config import *
 
-def find_closest_trigger(scanno, x, y, path=None):
-    # TODO: Include abs_pos option
+def find_closest_trigger(scanno, x, y, abs_pos=False, path=None):
     path = get_path(path)
     position_data = process_position_data(scanno, path)
+    if abs_pos:
+            scan_info = get_scan_info(scanno, 'socketserver', path)
+            xi = scan_info['xi']
+            yi = scan_info['yi']
+            xmin = scan_info['x_min'] * 1e-3
+            position_data['X_Position'] = position_data['X_Position'] * 1e-3 + xi + xmin
+            position_data['Y_Position'] = position_data['Y_Position'] * -1e-3 + yi
     position_data['distance'] = np.sqrt((position_data['X_Position'] - x)**2 + (position_data['Y_Position'] - y)**2)
     closest_trigger = position_data.loc[position_data['distance'].idxmin()]['Trigger']
     return int(closest_trigger)
 
-def plot_closest_frame(scanno, detector, x, y, path=None, log_scale=False, **kwargs):
-    imno = find_closest_trigger(scanno, x, y, path)
+def plot_closest_frame(scanno, detector, x, y, path=None, log_scale=False, abs_pos=False, **kwargs):
+    '''
+    Plot the detector frame acquired closest to a sample position.
+
+    On the XRF area detectors ('me7', 'rayspec') a frame's y axis indexes
+    detector elements rather than a spatial dimension, so the frame is summed
+    along y and plotted as a 1D spectrum (intensity vs energy channel) instead
+    of a 2D image. That is the same reduction a 1D roi applies in
+    process_roi_file, so the spectrum shows exactly what such an roi windows.
+    Every other detector is plotted as an image, unchanged.
+
+    Parameters:
+    - scanno: Scan number (int)
+    - detector: Detector name (str)
+    - x: Sample x position to find the closest trigger for (float, um)
+    - y: Sample y position to find the closest trigger for (float, um)
+    - path: Path to data files (str)
+    - log_scale: Log-scale the intensity - a LogNorm color scale for an image,
+        a logarithmic y axis for a spectrum (bool)
+    - kwargs: Additional keyword args, passed to plt.plot for a spectrum and
+        to plt.imshow for an image
+    '''
+    imno = find_closest_trigger(scanno, x, y, abs_pos=abs_pos, path=path)
     frame = load_image_from_scan(scanno, detector, imno, path)
-    plt.imshow(frame, norm=colors.LogNorm(vmin=1, vmax=frame.max()) if log_scale else None, **kwargs)
+
+    if detector.lower() in XRF_DETECTORS:
+        if frame.ndim != 2:
+            raise ValueError(
+                f"Binning along y requires a 2D frame, but frame {imno} of "
+                f"detector {detector!r} has shape {frame.shape}."
+            )
+        # y indexes detector elements: collapse them into one spectrum. The
+        # summation spans whatever y extent the detector has, so me7 and
+        # rayspec are handled alike.
+        spectrum = frame.sum(axis=0)
+        plt.plot(spectrum, **kwargs)
+        if log_scale:
+            plt.yscale('log')
+        plt.xlabel('Energy channel')
+        plt.ylabel('Intensity (summed over detector elements)')
+    else:
+        plt.imshow(frame, norm=colors.LogNorm(vmin=1, vmax=frame.max()) if log_scale else None, **kwargs)
+
     plt.show()
 
 def plot_flyscan(scanno, 
@@ -64,6 +109,7 @@ def plot_flyscan(scanno,
     roi_label = roi if isinstance(roi, str) else (roi.name if roi is not None else ch)
     ax.set_title(f'Scan {scanno} - {detector} - {roi_label}')
 
+    # Check that this is behaving properly, as I believe this shouldn't change based on abs_pos.
     if abs_pos:
         ax.invert_yaxis() # Invert y-axis to match the physical layout of the scan
 

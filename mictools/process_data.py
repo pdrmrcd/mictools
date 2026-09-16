@@ -695,6 +695,7 @@ def mesh_detector_data(scanno,
         nximages.attrs['parent_dataset']      = parent_dataset
         nximages.attrs['auxiliary_datasets']  = auxiliary_datasets
         nximages.attrs['operation']           = 'mesh_interpolation'
+        nximages.attrs['abs_pos']             = abs_pos
         if roi is not None:
             nximages.attrs['roi_type'] = roi_type
         nximages.create_dataset('X', data=x_axis)
